@@ -7,8 +7,13 @@ Initialize DB: modal run modal_app.py::init_db
 
 import modal
 import os
+import re
+from pathlib import Path
 
 # --- Modal Setup ---
+
+# Get the directory containing this file (for local problem loading)
+LOCAL_PROBLEMS_DIR = Path(__file__).parent / "problems"
 
 cuda_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -21,13 +26,14 @@ cuda_image = (
     )
     .pip_install("fastapi[standard]")
     .env({"PATH": "/usr/local/cuda-12.4/bin:$PATH"})
+    .add_local_dir(str(LOCAL_PROBLEMS_DIR), "/app/problems")  # Include problems in image
 )
 
 app = modal.App("kernel-leaderboard")
 vol = modal.Volume.from_name("leaderboard-data", create_if_missing=True)
 
 DB_PATH = "/data/leaderboard.db"
-PROBLEMS_DIR = "/data/problems"
+PROBLEMS_DIR = "/app/problems"
 
 # Optional: Set this to require an API key for submissions
 # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -35,94 +41,94 @@ PROBLEMS_DIR = "/data/problems"
 SUBMIT_API_KEY = os.environ.get("SUBMIT_API_KEY", None)
 
 
-# --- Problem Definitions ---
-# In production, load these from files. Inlining here for simplicity.
+# --- Problem Loading ---
 
-PROBLEMS = {
-    "week01_vectoradd": {
-        "name": "Vector Addition",
-        "setup": """
-const int N = 1 << 20;
-float *h_a, *h_b, *h_c, *h_ref;
-float *d_a, *d_b, *d_c;
+def parse_harness(harness_content: str) -> dict:
+    """Parse a harness.cu file into setup, launch, and validation sections."""
+    # Find section markers
+    setup_match = re.search(r'// === SETUP ===\n(.*?)(?=// === LAUNCH ===)', harness_content, re.DOTALL)
+    launch_match = re.search(r'// === LAUNCH ===\n(.*?)(?=// === VALIDATION ===)', harness_content, re.DOTALL)
+    validation_match = re.search(r'// === VALIDATION ===\n(.*?)$', harness_content, re.DOTALL)
 
-h_a = (float*)malloc(N * sizeof(float));
-h_b = (float*)malloc(N * sizeof(float));
-h_c = (float*)malloc(N * sizeof(float));
-h_ref = (float*)malloc(N * sizeof(float));
+    return {
+        "setup": setup_match.group(1).strip() if setup_match else "",
+        "launch": launch_match.group(1).strip() if launch_match else "",
+        "validation": validation_match.group(1).strip() if validation_match else "",
+    }
 
-for (int i = 0; i < N; i++) {
-    h_a[i] = i * 0.001f;
-    h_b[i] = i * 0.002f;
-    h_ref[i] = h_a[i] + h_b[i];  // Reference result
-}
 
-cudaMalloc(&d_a, N * sizeof(float));
-cudaMalloc(&d_b, N * sizeof(float));
-cudaMalloc(&d_c, N * sizeof(float));
+def parse_stub(stub_content: str) -> dict:
+    """Parse a stub.cu file to extract problem name and signature."""
+    # Extract problem name from first comment line like "* Problem: Vector Addition"
+    name_match = re.search(r'\* Problem: (.+)', stub_content)
+    name = name_match.group(1).strip() if name_match else "Unknown Problem"
 
-cudaMemcpy(d_a, h_a, N * sizeof(float), cudaMemcpyHostToDevice);
-cudaMemcpy(d_b, h_b, N * sizeof(float), cudaMemcpyHostToDevice);
-""",
-        "launch": "vectorAdd<<<(N + 255) / 256, 256>>>(d_a, d_b, d_c, N);",
-        "validation": """
-cudaMemcpy(h_c, d_c, N * sizeof(float), cudaMemcpyDeviceToHost);
-int errors = 0;
-for (int i = 0; i < N; i++) {
-    if (fabs(h_c[i] - h_ref[i]) > 1e-5) errors++;
-}
-if (errors > 0) {
-    fprintf(stderr, "Validation failed: %d errors\\n", errors);
-    return 1;
-}
-""",
-        "expected_signature": "__global__ void vectorAdd(float *a, float *b, float *c, int n)",
-    },
-    "week02_matmul_naive": {
-        "name": "Matrix Multiplication (Naive)",
-        "setup": """
-const int M = 1024, N = 1024, K = 1024;
-float *h_A, *h_B, *h_C;
-float *d_A, *d_B, *d_C;
+    # Extract signature - look for __global__ void function declaration
+    sig_match = re.search(r'(__global__\s+void\s+\w+\s*\([^)]*\))', stub_content)
+    signature = sig_match.group(1).strip() if sig_match else ""
 
-h_A = (float*)malloc(M * K * sizeof(float));
-h_B = (float*)malloc(K * N * sizeof(float));
-h_C = (float*)malloc(M * N * sizeof(float));
+    return {"name": name, "expected_signature": signature}
 
-for (int i = 0; i < M * K; i++) h_A[i] = (i % 100) * 0.01f;
-for (int i = 0; i < K * N; i++) h_B[i] = (i % 100) * 0.01f;
 
-cudaMalloc(&d_A, M * K * sizeof(float));
-cudaMalloc(&d_B, K * N * sizeof(float));
-cudaMalloc(&d_C, M * N * sizeof(float));
+def load_problems(problems_dir: str) -> dict:
+    """Load all problems from the problems directory."""
+    problems = {}
+    problems_path = Path(problems_dir)
 
-cudaMemcpy(d_A, h_A, M * K * sizeof(float), cudaMemcpyHostToDevice);
-cudaMemcpy(d_B, h_B, K * N * sizeof(float), cudaMemcpyHostToDevice);
-""",
-        "launch": """
-dim3 block(16, 16);
-dim3 grid((N + 15) / 16, (M + 15) / 16);
-matmul<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-""",
-        "validation": """
-// Simplified validation - check a few elements
-cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-// For now just check it ran without error
-""",
-        "expected_signature": "__global__ void matmul(float *A, float *B, float *C, int M, int N, int K)",
-    },
-}
+    if not problems_path.exists():
+        return problems
+
+    for problem_dir in sorted(problems_path.iterdir()):
+        if not problem_dir.is_dir() or problem_dir.name.startswith('.'):
+            continue
+
+        harness_path = problem_dir / "harness.cu"
+        stub_path = problem_dir / "stub.cu"
+
+        if not harness_path.exists() or not stub_path.exists():
+            continue
+
+        harness_content = harness_path.read_text()
+        stub_content = stub_path.read_text()
+
+        harness_data = parse_harness(harness_content)
+        stub_data = parse_stub(stub_content)
+
+        problem_id = problem_dir.name
+        problems[problem_id] = {
+            "name": stub_data["name"],
+            "expected_signature": stub_data["expected_signature"],
+            **harness_data,
+        }
+
+    return problems
+
+
+# Load problems at module level (for local testing)
+# In Modal, this will be re-loaded from /app/problems
+PROBLEMS = load_problems(str(LOCAL_PROBLEMS_DIR))
+
+
+def get_problems():
+    """Get problems dict, reloading from PROBLEMS_DIR if running in Modal."""
+    global PROBLEMS
+    # In Modal container, reload from /app/problems
+    if Path(PROBLEMS_DIR).exists() and not PROBLEMS:
+        PROBLEMS = load_problems(PROBLEMS_DIR)
+    return PROBLEMS
 
 
 def build_harness(problem_id: str, user_kernel: str) -> str:
     """Wrap user's kernel in timing/validation harness."""
-    problem = PROBLEMS[problem_id]
-    
+    problems = get_problems()
+    problem = problems[problem_id]
+
     return f"""
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
 // ============ USER KERNEL ============
 {user_kernel}
@@ -131,39 +137,39 @@ def build_harness(problem_id: str, user_kernel: str) -> str:
 int main() {{
     // Setup
     {problem["setup"]}
-    
+
     // Warmup runs
     for (int i = 0; i < 3; i++) {{
         {problem["launch"]}
     }}
     cudaDeviceSynchronize();
-    
+
     // Check for errors after warmup
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {{
         fprintf(stderr, "CUDA error: %s\\n", cudaGetErrorString(err));
         return 1;
     }}
-    
+
     // Timed run
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    
+
     cudaEventRecord(start);
     {problem["launch"]}
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    
+
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    
+
     // Validation
     {problem["validation"]}
-    
+
     // Output time (parsed by benchmark harness)
     printf("%f\\n", ms);
-    
+
     return 0;
 }}
 """
@@ -216,12 +222,13 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
     import sqlite3
     import hashlib
     from datetime import datetime
-    
-    if problem_id not in PROBLEMS:
+
+    problems = get_problems()
+    if problem_id not in problems:
         return {
             "success": False,
             "error": "unknown_problem",
-            "message": f"Problem '{problem_id}' not found. Available: {list(PROBLEMS.keys())}",
+            "message": f"Problem '{problem_id}' not found. Available: {list(problems.keys())}",
         }
     
     kernel_hash = hashlib.sha256(kernel_source.encode()).hexdigest()[:16]
@@ -302,13 +309,14 @@ def leaderboard(problem_id: str = None):
     """Get leaderboard data as JSON."""
     import sqlite3
 
+    problems = get_problems()
     vol.reload()  # Get latest data from other containers
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    
+
     if problem_id:
         rows = conn.execute("""
-            SELECT 
+            SELECT
                 user_id,
                 MIN(time_ms) as best_time_ms,
                 COUNT(*) as attempts,
@@ -318,10 +326,10 @@ def leaderboard(problem_id: str = None):
             GROUP BY user_id
             ORDER BY best_time_ms ASC
         """, (problem_id,)).fetchall()
-        
+
         result = {
             "problem_id": problem_id,
-            "problem_name": PROBLEMS.get(problem_id, {}).get("name", problem_id),
+            "problem_name": problems.get(problem_id, {}).get("name", problem_id),
             "rankings": [
                 {
                     "rank": i + 1,
@@ -348,7 +356,7 @@ def leaderboard(problem_id: str = None):
             "problems": [
                 {
                     "problem_id": r["problem_id"],
-                    "problem_name": PROBLEMS.get(r["problem_id"], {}).get("name", r["problem_id"]),
+                    "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
                     "participants": r["participants"],
                     "total_submissions": r["total_submissions"],
                     "best_time_ms": round(r["best_time_ms"], 4) if r["best_time_ms"] else None,
@@ -365,6 +373,7 @@ def leaderboard(problem_id: str = None):
 @modal.fastapi_endpoint(method="GET")
 def problems():
     """List available problems."""
+    all_problems = get_problems()
     return {
         "problems": [
             {
@@ -372,7 +381,7 @@ def problems():
                 "name": pdata["name"],
                 "expected_signature": pdata["expected_signature"],
             }
-            for pid, pdata in PROBLEMS.items()
+            for pid, pdata in all_problems.items()
         ]
     }
 
@@ -441,11 +450,12 @@ def submit(request: dict):
     import hashlib
     from datetime import datetime
 
-    if problem_id not in PROBLEMS:
+    problems = get_problems()
+    if problem_id not in problems:
         return {
             "success": False,
             "error": "unknown_problem",
-            "message": f"Problem '{problem_id}' not found. Available: {list(PROBLEMS.keys())}",
+            "message": f"Problem '{problem_id}' not found. Available: {list(problems.keys())}",
         }
 
     kernel_hash = hashlib.sha256(kernel_source.encode()).hexdigest()[:16]
@@ -521,9 +531,15 @@ def submit(request: dict):
 # --- Local entrypoint for testing ---
 
 @app.local_entrypoint()
-def main(action: str = "test"):
+def main(action: str = "test", problem: str = "01_vectoradd"):
     if action == "init":
         init_db.remote()
+    elif action == "list":
+        # List all available problems
+        probs = get_problems()
+        print(f"Available problems ({len(probs)}):")
+        for pid, pdata in probs.items():
+            print(f"  {pid}: {pdata['name']}")
     elif action == "test":
         # Test with a simple vector add kernel
         test_kernel = """
@@ -534,5 +550,5 @@ __global__ void vectorAdd(float *a, float *b, float *c, int n) {
     }
 }
 """
-        result = benchmark_kernel.remote("week01_vectoradd", "test_user", test_kernel)
+        result = benchmark_kernel.remote(problem, "test_user", test_kernel)
         print(f"Result: {result}")
