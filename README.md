@@ -4,11 +4,20 @@ A Modal-based benchmarking system for learning CUDA, inspired by [GPU Mode's ker
 
 ## Quick Start
 
-### 1. Install Modal
+### 1. Install Dependencies
 
 ```bash
-pip install modal
-modal setup  # Authenticate with Modal
+# Using uv (recommended)
+uv venv && source .venv/bin/activate
+uv pip install -e .
+
+# Or with pip
+pip install modal requests
+```
+
+Then authenticate with Modal:
+```bash
+modal setup
 ```
 
 ### 2. Deploy the Leaderboard
@@ -20,25 +29,42 @@ modal run modal_app.py::init_db  # Initialize the database
 
 ### 3. Submit Your First Kernel
 
+**Option A: CLI (requires Modal SDK)**
 ```bash
 export LEADERBOARD_USER="your_name"
-python submit.py week01_vectoradd examples/week01_vectoradd_baseline.cu
+python submit.py week01_vectoradd week01_vectoradd_baseline.cu
+```
+
+**Option B: HTTP POST (no Modal SDK needed)**
+```bash
+curl -X POST https://your-workspace--kernel-leaderboard-submit.modal.run \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg src "$(cat week01_vectoradd_baseline.cu)" '{
+    "problem_id": "week01_vectoradd",
+    "user_id": "your_name",
+    "kernel_source": $src
+  }')"
 ```
 
 ### 4. View the Leaderboard
 
-After deploying, Modal gives you a URL like:
+After deploying, Modal gives you URLs like:
 ```
 https://your-workspace--kernel-leaderboard-leaderboard.modal.run
+https://your-workspace--kernel-leaderboard-submit.modal.run
+https://your-workspace--kernel-leaderboard-problems.modal.run
 ```
 
-Query it with:
+Query them with:
 ```bash
 # All problems overview
 curl https://your-workspace--kernel-leaderboard-leaderboard.modal.run
 
 # Specific problem rankings
 curl "https://your-workspace--kernel-leaderboard-leaderboard.modal.run?problem_id=week01_vectoradd"
+
+# List available problems
+curl https://your-workspace--kernel-leaderboard-problems.modal.run
 ```
 
 ## How It Works
@@ -46,11 +72,44 @@ curl "https://your-workspace--kernel-leaderboard-leaderboard.modal.run?problem_i
 When you submit a kernel, the system:
 
 1. Wraps your kernel in a timing harness with predetermined inputs
-2. Compiles it with `nvcc -O3` on Modal's GPU instances
-3. Runs warmup iterations, then 10 timed runs
+2. Compiles it with `nvcc -O3 -arch=sm_75` on Modal's T4 GPU instances
+3. Runs 3 warmup iterations, then 10 timed runs
 4. Validates correctness against reference outputs
-5. Records the median time to a SQLite database
+5. Records the median time to a SQLite database (persisted on Modal Volume)
 6. Returns your results
+
+## Architecture
+
+The Modal app uses:
+- **debian_slim** base image with CUDA 12.4 nvcc compiler installed via NVIDIA's apt repository
+- **FastAPI** endpoints for HTTP access (`@modal.fastapi_endpoint`)
+- **Modal Volume** for persistent SQLite storage
+- **T4 GPUs** for kernel execution (limited to 3 concurrent containers to prevent abuse)
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/leaderboard` | GET | View rankings (optional `?problem_id=` filter) |
+| `/problems` | GET | List available problems with signatures |
+| `/submit` | POST | Submit a kernel for benchmarking |
+
+### Submit Endpoint
+
+POST JSON body:
+```json
+{
+  "problem_id": "week01_vectoradd",
+  "user_id": "your_name",
+  "kernel_source": "__global__ void vectorAdd(...) { ... }",
+  "api_key": "optional_if_configured"
+}
+```
+
+To require an API key for submissions, set the `SUBMIT_API_KEY` environment variable in Modal:
+```bash
+modal secret create leaderboard-secrets SUBMIT_API_KEY=your_secret_key
+```
 
 ## Problems
 
@@ -106,5 +165,6 @@ This is a simplified implementation suitable for small teams. The main differenc
 - No GitHub integration for submissions
 - No fancy web UI (just JSON endpoints)
 - Problems defined in Python rather than separate config files
+- Public HTTP endpoint allows submissions without Modal SDK
 
 For a team learning project, this keeps things simple while providing the core benchmark-and-compare functionality.
