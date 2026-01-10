@@ -49,6 +49,18 @@ def submit(problem_id: str, kernel_file: str, user_id: str):
     )
 
     if result["success"]:
+        # Persist the result to the leaderboard DB (separate function to keep /data away from untrusted execution).
+        try:
+            record = modal.Function.from_name("kernel-leaderboard", "record_submission")
+            record.remote(
+                problem_id=problem_id,
+                user_id=user_id,
+                time_ms=result["time_ms"],
+                kernel_hash=result["kernel_hash"],
+            )
+        except Exception as e:
+            print(f"Warning: benchmark succeeded but failed to record submission: {e}")
+
         print("✓ Submission successful!")
         print(f"  Median time: {result['time_ms']:.4f} ms")
         print(f"  All runs:    {', '.join(f'{t:.4f}' for t in result['times'])} ms")

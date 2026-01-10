@@ -43,6 +43,11 @@ PROBLEMS_DIR = "/app/problems"
 # Leave as None for open access
 SUBMIT_API_KEY = os.environ.get("SUBMIT_API_KEY", None)
 
+MAX_KERNEL_SOURCE_BYTES = 50_000
+MAX_USER_ID_LENGTH = 64
+MAX_COMPILE_OUTPUT_BYTES = 200_000
+MAX_RUN_OUTPUT_BYTES = 100_000
+
 
 # --- Security: Kernel Source Validation ---
 
@@ -159,21 +164,22 @@ def get_problems():
     return PROBLEMS
 
 
-def build_harness(problem_id: str, user_kernel: str) -> str:
-    """Wrap user's kernel in timing/validation harness."""
+def build_harness_tu(problem_id: str) -> str:
+    """Build the harness translation unit (host code) without inlining user source."""
     problems = get_problems()
     problem = problems[problem_id]
 
+    expected_signature = (problem.get("expected_signature") or "").strip()
+    forward_decl = f"{expected_signature};" if expected_signature else ""
+
     return f"""
 #include <cuda_runtime.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <string.h>
 
-// ============ USER KERNEL ============
-{user_kernel}
-// =====================================
+{forward_decl}
 
 int main() {{
     // Setup
@@ -208,13 +214,82 @@ int main() {{
     // Validation
     {problem["validation"]}
 
-    // Output time (parsed by benchmark harness)
-    printf("%f\\n", ms);
+    // Output time with a sentinel to make parsing robust.
+    printf("TIME_MS=%f\\n", ms);
 
     return 0;
 }}
 """
 
+
+def validate_submission_inputs(problem_id: str, user_id: str, kernel_source: str) -> tuple[bool, str, str]:
+    if not isinstance(problem_id, str) or not isinstance(kernel_source, str):
+        return False, "invalid_payload", "problem_id and kernel_source must be strings"
+    if user_id is not None and not isinstance(user_id, str):
+        return False, "invalid_payload", "user_id must be a string"
+    if not problem_id or not kernel_source:
+        return False, "missing_fields", "Required fields: problem_id, kernel_source"
+    if len(kernel_source) > MAX_KERNEL_SOURCE_BYTES:
+        return False, "kernel_too_large", f"Kernel source must be under {MAX_KERNEL_SOURCE_BYTES} bytes"
+    if user_id is None:
+        user_id = "anonymous"
+    if len(user_id) > MAX_USER_ID_LENGTH:
+        return False, "invalid_user_id", f"User ID must be under {MAX_USER_ID_LENGTH} characters"
+    return True, "", ""
+
+
+def run_limited_subprocess(
+    *,
+    args: list[str],
+    cwd: str,
+    env: dict[str, str] | None,
+    timeout_s: int,
+    max_output_bytes: int,
+) -> tuple[int, str, bool]:
+    """
+    Run a subprocess capturing combined stdout/stderr to a file, enforcing an output size cap.
+
+    Returns (returncode, output, timed_out).
+    """
+    import subprocess
+
+    out_path = os.path.join(cwd, "proc_output.txt")
+    try:
+        with open(out_path, "wb") as out:
+            result = subprocess.run(
+                args,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                timeout=timeout_s,
+            )
+        size = os.path.getsize(out_path)
+        with open(out_path, "rb") as f:
+            output_bytes = f.read(max_output_bytes + 1)
+        output = output_bytes[:max_output_bytes].decode(errors="replace")
+        if size > max_output_bytes:
+            return 1, f"Process output exceeded {max_output_bytes} bytes (truncated):\n{output}", False
+        return result.returncode, output, False
+    except subprocess.TimeoutExpired:
+        return 124, "Process timed out", True
+
+
+def parse_time_ms(stdout: str) -> float:
+    import math
+
+    time_ms = None
+    for line in stdout.splitlines():
+        if line.startswith("TIME_MS="):
+            value = line.split("=", 1)[1].strip()
+            try:
+                time_ms = float(value)
+            except ValueError:
+                continue
+    if time_ms is None or not math.isfinite(time_ms):
+        raise ValueError("Could not parse TIME_MS from output")
+    return time_ms
 
 # --- Modal Functions ---
 
@@ -251,20 +326,62 @@ def init_db():
     vol.commit()
     print("Database initialized!")
 
+@app.function(image=cuda_image, volumes={"/data": vol}, timeout=30)
+def record_submission(problem_id: str, user_id: str, time_ms: float, kernel_hash: str) -> None:
+    """Persist a benchmark result to SQLite (separate from untrusted kernel execution)."""
+    import sqlite3
+    from datetime import datetime
+
+    os.makedirs("/data", exist_ok=True)
+    vol.reload()
+
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            problem_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            time_ms REAL NOT NULL,
+            kernel_hash TEXT,
+            submitted_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_problem_user ON submissions(problem_id, user_id);
+        CREATE INDEX IF NOT EXISTS idx_problem_time ON submissions(problem_id, time_ms);
+
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            created_at TEXT NOT NULL
+        );
+    """)
+    conn.execute(
+        """
+        INSERT INTO submissions (problem_id, user_id, time_ms, kernel_hash, submitted_at)
+        VALUES (?, ?, ?, ?, ?)
+    """,
+        (problem_id, user_id, time_ms, kernel_hash, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    vol.commit()
+
 
 @app.function(
     image=cuda_image,
     gpu="T4",
-    volumes={"/data": vol},
     timeout=120,
+    max_containers=3,  # Prevent abuse
 )
 def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
     """Compile and benchmark a user's kernel submission."""
     import hashlib
-    import sqlite3
-    import subprocess
     import tempfile
-    from datetime import datetime
+
+    ok, err, msg = validate_submission_inputs(problem_id, user_id, kernel_source)
+    if not ok:
+        return {"success": False, "error": err, "message": msg}
+    user_id = user_id or "anonymous"
 
     problems = get_problems()
     if problem_id not in problems:
@@ -286,79 +403,83 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
     kernel_hash = hashlib.sha256(kernel_source.encode()).hexdigest()[:16]
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        kernel_path = os.path.join(tmpdir, "kernel.cu")
+        harness_path = os.path.join(tmpdir, "harness.cu")
+        user_path = os.path.join(tmpdir, "user.cu")
         binary_path = os.path.join(tmpdir, "kernel")
 
-        # Build full source with harness
-        full_source = build_harness(problem_id, kernel_source)
+        harness_source = build_harness_tu(problem_id)
 
-        with open(kernel_path, "w") as f:
-            f.write(full_source)
+        with open(harness_path, "w") as f:
+            f.write(harness_source)
+
+        with open(user_path, "w") as f:
+            f.write(kernel_source)
 
         # Compile
-        compile_result = subprocess.run(
-            ["nvcc", "-O3", "-arch=sm_75", "-o", binary_path, kernel_path],
-            capture_output=True,
-            text=True,
-            timeout=60,
+        returncode, compile_output, timed_out = run_limited_subprocess(
+            args=["nvcc", "-O3", "-arch=sm_75", "-o", binary_path, harness_path, user_path],
+            cwd=tmpdir,
+            env=None,
+            timeout_s=60,
+            max_output_bytes=MAX_COMPILE_OUTPUT_BYTES,
         )
 
-        if compile_result.returncode != 0:
+        if timed_out:
+            return {
+                "success": False,
+                "error": "compilation_timeout",
+                "message": "Compilation timed out",
+            }
+
+        if returncode != 0:
             return {
                 "success": False,
                 "error": "compilation_failed",
-                "message": sanitize_error_message(compile_result.stderr),
+                "message": sanitize_error_message(compile_output),
             }
 
         # Run benchmark (multiple iterations)
         # Security: Run with empty environment and isolated working directory
+        safe_env = {}
+        if "PATH" in os.environ:
+            safe_env["PATH"] = os.environ["PATH"]
+        if "LD_LIBRARY_PATH" in os.environ:
+            safe_env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+
         times = []
         for _ in range(10):
-            result = subprocess.run(
-                [binary_path],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env={},
+            returncode, output, timed_out = run_limited_subprocess(
+                args=[binary_path],
                 cwd=tmpdir,
+                env=safe_env,
+                timeout_s=30,
+                max_output_bytes=MAX_RUN_OUTPUT_BYTES,
             )
 
-            if result.returncode != 0:
-                # Include both stdout and stderr for better debugging
-                error_details = []
-                if result.stderr:
-                    error_details.append(sanitize_error_message(result.stderr))
-                if result.stdout:
-                    error_details.append(sanitize_error_message(result.stdout))
+            if timed_out:
+                return {
+                    "success": False,
+                    "error": "runtime_timeout",
+                    "message": "Kernel execution timed out",
+                }
+
+            if returncode != 0:
                 return {
                     "success": False,
                     "error": "runtime_error",
-                    "message": "\n".join(error_details) or "Kernel execution failed (no output)",
+                    "message": sanitize_error_message(output) or "Kernel execution failed (no output)",
                 }
 
             try:
-                times.append(float(result.stdout.strip()))
-            except ValueError:
+                times.append(parse_time_ms(output))
+            except ValueError as e:
                 return {
                     "success": False,
                     "error": "parse_error",
-                    "message": f"Could not parse output: {result.stdout}",
+                    "message": f"{e}. Output:\n{sanitize_error_message(output)}",
                 }
 
         median_time = sorted(times)[len(times) // 2]
-
-        # Record to database
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            """
-            INSERT INTO submissions (problem_id, user_id, time_ms, kernel_hash, submitted_at)
-            VALUES (?, ?, ?, ?, ?)
-        """,
-            (problem_id, user_id, median_time, kernel_hash, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-        conn.close()
-        vol.commit()
 
         return {
             "success": True,
@@ -497,10 +618,7 @@ def index():
 
 @app.function(
     image=cuda_image,
-    gpu="T4",
-    volumes={"/data": vol},
     timeout=120,
-    max_containers=3,  # Prevent abuse
 )
 @modal.fastapi_endpoint(method="POST")
 def submit(request: dict):
@@ -521,27 +639,9 @@ def submit(request: dict):
     user_id = request.get("user_id", "anonymous")
     kernel_source = request.get("kernel_source")
 
-    if not problem_id or not kernel_source:
-        return {
-            "success": False,
-            "error": "missing_fields",
-            "message": "Required fields: problem_id, kernel_source",
-        }
-
-    # Basic validation to prevent abuse
-    if len(kernel_source) > 50000:  # 50KB limit
-        return {
-            "success": False,
-            "error": "kernel_too_large",
-            "message": "Kernel source must be under 50KB",
-        }
-
-    if len(user_id) > 64:
-        return {
-            "success": False,
-            "error": "invalid_user_id",
-            "message": "User ID must be under 64 characters",
-        }
+    ok, err, msg = validate_submission_inputs(problem_id, user_id, kernel_source)
+    if not ok:
+        return {"success": False, "error": err, "message": msg}
 
     # Optional API key check
     if SUBMIT_API_KEY is not None:
@@ -553,110 +653,16 @@ def submit(request: dict):
                 "message": "Invalid or missing API key",
             }
 
-    import hashlib
-    import sqlite3
-    import subprocess
-    import tempfile
-    from datetime import datetime
+    result = benchmark_kernel.remote(problem_id, user_id, kernel_source)
+    if not result.get("success"):
+        return result
 
-    problems = get_problems()
-    if problem_id not in problems:
-        return {
-            "success": False,
-            "error": "unknown_problem",
-            "message": f"Problem '{problem_id}' not found. Available: {list(problems.keys())}",
-        }
-
-    # Security: Validate kernel source for dangerous patterns
-    is_valid, validation_error = validate_kernel_source(kernel_source)
-    if not is_valid:
-        return {
-            "success": False,
-            "error": "blocked_pattern",
-            "message": f"Kernel rejected: {validation_error}",
-        }
-
-    kernel_hash = hashlib.sha256(kernel_source.encode()).hexdigest()[:16]
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        kernel_path = os.path.join(tmpdir, "kernel.cu")
-        binary_path = os.path.join(tmpdir, "kernel")
-
-        full_source = build_harness(problem_id, kernel_source)
-
-        with open(kernel_path, "w") as f:
-            f.write(full_source)
-
-        compile_result = subprocess.run(
-            ["nvcc", "-O3", "-arch=sm_75", "-o", binary_path, kernel_path],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-
-        if compile_result.returncode != 0:
-            return {
-                "success": False,
-                "error": "compilation_failed",
-                "message": sanitize_error_message(compile_result.stderr),
-            }
-
-        # Security: Run with empty environment and isolated working directory
-        times = []
-        for _ in range(10):
-            result = subprocess.run(
-                [binary_path],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env={},
-                cwd=tmpdir,
-            )
-
-            if result.returncode != 0:
-                # Include both stdout and stderr for better debugging
-                error_details = []
-                if result.stderr:
-                    error_details.append(sanitize_error_message(result.stderr))
-                if result.stdout:
-                    error_details.append(sanitize_error_message(result.stdout))
-                return {
-                    "success": False,
-                    "error": "runtime_error",
-                    "message": "\n".join(error_details) or "Kernel execution failed (no output)",
-                }
-
-            try:
-                times.append(float(result.stdout.strip()))
-            except ValueError:
-                return {
-                    "success": False,
-                    "error": "parse_error",
-                    "message": f"Could not parse output: {result.stdout}",
-                }
-
-        median_time = sorted(times)[len(times) // 2]
-
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            """
-            INSERT INTO submissions (problem_id, user_id, time_ms, kernel_hash, submitted_at)
-            VALUES (?, ?, ?, ?, ?)
-        """,
-            (problem_id, user_id, median_time, kernel_hash, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-        conn.close()
-        vol.commit()
-
-        return {
-            "success": True,
-            "time_ms": median_time,
-            "times": times,
-            "kernel_hash": kernel_hash,
-            "user_id": user_id,
-            "problem_id": problem_id,
-        }
+    record_submission.remote(problem_id, user_id, result["time_ms"], result["kernel_hash"])
+    return {
+        **result,
+        "user_id": user_id,
+        "problem_id": problem_id,
+    }
 
 
 # --- Local entrypoint for testing ---
