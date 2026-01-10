@@ -632,8 +632,8 @@
 
         function renderProblemList() {
             problemList.innerHTML = problems.map(p => `
-                <li data-id="${p.id}" class="${currentProblem?.id === p.id ? 'active' : ''}">
-                    ${p.name}
+                <li data-id="${escapeHtml(p.id)}" class="${currentProblem?.id === p.id ? 'active' : ''}">
+                    ${escapeHtml(p.name)}
                 </li>
             `).join('');
 
@@ -728,7 +728,7 @@
                     return `
                         <li>
                             <span class="leaderboard-rank ${rankClass}">${r.rank}.</span>
-                            <span class="leaderboard-user">${r.user_id}</span>
+                            <span class="leaderboard-user">${escapeHtml(r.user_id)}</span>
                             <span class="leaderboard-time">${r.best_time_ms.toFixed(4)}ms</span>
                         </li>
                     `;
@@ -744,6 +744,14 @@
 
         function getEditorContent() {
             return editor.getValue();
+        }
+
+        // Security: Escape HTML to prevent XSS attacks
+        function escapeHtml(str) {
+            if (!str) return '';
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
         }
 
         async function handleSubmit() {

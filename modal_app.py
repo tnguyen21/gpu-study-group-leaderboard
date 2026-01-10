@@ -44,6 +44,43 @@ PROBLEMS_DIR = "/app/problems"
 SUBMIT_API_KEY = os.environ.get("SUBMIT_API_KEY", None)
 
 
+# --- Security: Kernel Source Validation ---
+
+# Patterns that indicate potentially dangerous code
+BLOCKED_PATTERNS = [
+    (r"#include\s*[<\"](?!cuda|cstdio|cstdlib|cmath|cstring|climits)", "Only CUDA/standard includes allowed"),
+    (r"__attribute__\s*\(\s*\(", "Compiler attributes not allowed"),
+    (r"\bsystem\s*\(", "system() calls not allowed"),
+    (r"\b(execv?[pel]?|popen|fork)\s*\(", "Process spawning not allowed"),
+    (r"\b(socket|connect|bind|listen|accept|send|recv)\s*\(", "Network calls not allowed"),
+    (r"\b(fopen|freopen)\s*\([^)]*['\"]\/", "Absolute path file access not allowed"),
+    (r"\bopen\s*\([^)]*['\"]\/", "Absolute path access not allowed"),
+    (r"\bgetenv\s*\(", "Environment variable access not allowed"),
+    (r"\/etc\/|\/proc\/|\/data\/", "Sensitive path access not allowed"),
+    (r"\basm\s*\(|__asm__", "Inline assembly not allowed"),
+    (r"\bdlopen\s*\(|\bdlsym\s*\(", "Dynamic loading not allowed"),
+]
+
+
+def validate_kernel_source(source: str) -> tuple[bool, str]:
+    """
+    Check kernel source for dangerous patterns.
+
+    Returns (is_valid, error_message).
+    """
+    for pattern, message in BLOCKED_PATTERNS:
+        if re.search(pattern, source, re.IGNORECASE):
+            return False, message
+    return True, ""
+
+
+def sanitize_error_message(error: str) -> str:
+    """Remove sensitive paths from error messages."""
+    error = re.sub(r"/tmp/tmp[a-zA-Z0-9_]+/", "", error)
+    error = re.sub(r"/app/", "", error)
+    return error
+
+
 # --- Problem Loading ---
 
 
@@ -237,6 +274,15 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
             "message": f"Problem '{problem_id}' not found. Available: {list(problems.keys())}",
         }
 
+    # Security: Validate kernel source for dangerous patterns
+    is_valid, validation_error = validate_kernel_source(kernel_source)
+    if not is_valid:
+        return {
+            "success": False,
+            "error": "blocked_pattern",
+            "message": f"Kernel rejected: {validation_error}",
+        }
+
     kernel_hash = hashlib.sha256(kernel_source.encode()).hexdigest()[:16]
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -254,16 +300,18 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
             ["nvcc", "-O3", "-arch=sm_75", "-o", binary_path, kernel_path],
             capture_output=True,
             text=True,
+            timeout=60,
         )
 
         if compile_result.returncode != 0:
             return {
                 "success": False,
                 "error": "compilation_failed",
-                "message": compile_result.stderr,
+                "message": sanitize_error_message(compile_result.stderr),
             }
 
         # Run benchmark (multiple iterations)
+        # Security: Run with empty environment and isolated working directory
         times = []
         for _ in range(10):
             result = subprocess.run(
@@ -271,13 +319,15 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env={},
+                cwd=tmpdir,
             )
 
             if result.returncode != 0:
                 return {
                     "success": False,
                     "error": "runtime_error",
-                    "message": result.stderr or "Kernel execution failed",
+                    "message": sanitize_error_message(result.stderr) or "Kernel execution failed",
                 }
 
             try:
@@ -486,7 +536,27 @@ def submit(request: dict):
     import sqlite3
     import subprocess
     import tempfile
-    from datetime import datetime
+    from datetime import datetime, timedelta
+
+    # Security: Rate limiting - check last submission time for this user
+    vol.reload()
+    conn = sqlite3.connect(DB_PATH)
+    last_submit = conn.execute(
+        "SELECT submitted_at FROM submissions WHERE user_id = ? ORDER BY submitted_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+
+    if last_submit:
+        last_time = datetime.fromisoformat(last_submit[0])
+        cooldown = timedelta(seconds=30)
+        if datetime.utcnow() - last_time < cooldown:
+            remaining = int((cooldown - (datetime.utcnow() - last_time)).total_seconds())
+            return {
+                "success": False,
+                "error": "rate_limited",
+                "message": f"Please wait {remaining}s before submitting again",
+            }
 
     problems = get_problems()
     if problem_id not in problems:
@@ -494,6 +564,15 @@ def submit(request: dict):
             "success": False,
             "error": "unknown_problem",
             "message": f"Problem '{problem_id}' not found. Available: {list(problems.keys())}",
+        }
+
+    # Security: Validate kernel source for dangerous patterns
+    is_valid, validation_error = validate_kernel_source(kernel_source)
+    if not is_valid:
+        return {
+            "success": False,
+            "error": "blocked_pattern",
+            "message": f"Kernel rejected: {validation_error}",
         }
 
     kernel_hash = hashlib.sha256(kernel_source.encode()).hexdigest()[:16]
@@ -511,15 +590,17 @@ def submit(request: dict):
             ["nvcc", "-O3", "-arch=sm_75", "-o", binary_path, kernel_path],
             capture_output=True,
             text=True,
+            timeout=60,
         )
 
         if compile_result.returncode != 0:
             return {
                 "success": False,
                 "error": "compilation_failed",
-                "message": compile_result.stderr,
+                "message": sanitize_error_message(compile_result.stderr),
             }
 
+        # Security: Run with empty environment and isolated working directory
         times = []
         for _ in range(10):
             result = subprocess.run(
@@ -527,13 +608,15 @@ def submit(request: dict):
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env={},
+                cwd=tmpdir,
             )
 
             if result.returncode != 0:
                 return {
                     "success": False,
                     "error": "runtime_error",
-                    "message": result.stderr or "Kernel execution failed",
+                    "message": sanitize_error_message(result.stderr) or "Kernel execution failed",
                 }
 
             try:
