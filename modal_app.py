@@ -382,7 +382,7 @@ def problems():
     gpu="T4",
     volumes={"/data": vol},
     timeout=120,
-    concurrency_limit=3,  # Prevent abuse
+    max_containers=3,  # Prevent abuse
 )
 @modal.fastapi_endpoint(method="POST")
 def submit(request: dict):
