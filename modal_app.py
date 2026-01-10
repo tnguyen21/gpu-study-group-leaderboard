@@ -5,15 +5,17 @@ Deploy with: modal deploy modal_app.py
 Initialize DB: modal run modal_app.py::init_db
 """
 
-import modal
 import os
 import re
 from pathlib import Path
+
+import modal
 
 # --- Modal Setup ---
 
 # Get the directory containing this file (for local problem loading)
 LOCAL_PROBLEMS_DIR = Path(__file__).parent / "problems"
+LOCAL_STATIC_DIR = Path(__file__).parent / "static"
 
 cuda_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -27,6 +29,7 @@ cuda_image = (
     .pip_install("fastapi[standard]")
     .env({"PATH": "/usr/local/cuda-12.4/bin:$PATH"})
     .add_local_dir(str(LOCAL_PROBLEMS_DIR), "/app/problems")  # Include problems in image
+    .add_local_dir(str(LOCAL_STATIC_DIR), "/app/static")  # Include static files for web UI
 )
 
 app = modal.App("kernel-leaderboard")
@@ -43,12 +46,13 @@ SUBMIT_API_KEY = os.environ.get("SUBMIT_API_KEY", None)
 
 # --- Problem Loading ---
 
+
 def parse_harness(harness_content: str) -> dict:
     """Parse a harness.cu file into setup, launch, and validation sections."""
     # Find section markers
-    setup_match = re.search(r'// === SETUP ===\n(.*?)(?=// === LAUNCH ===)', harness_content, re.DOTALL)
-    launch_match = re.search(r'// === LAUNCH ===\n(.*?)(?=// === VALIDATION ===)', harness_content, re.DOTALL)
-    validation_match = re.search(r'// === VALIDATION ===\n(.*?)$', harness_content, re.DOTALL)
+    setup_match = re.search(r"// === SETUP ===\n(.*?)(?=// === LAUNCH ===)", harness_content, re.DOTALL)
+    launch_match = re.search(r"// === LAUNCH ===\n(.*?)(?=// === VALIDATION ===)", harness_content, re.DOTALL)
+    validation_match = re.search(r"// === VALIDATION ===\n(.*?)$", harness_content, re.DOTALL)
 
     return {
         "setup": setup_match.group(1).strip() if setup_match else "",
@@ -60,11 +64,11 @@ def parse_harness(harness_content: str) -> dict:
 def parse_stub(stub_content: str) -> dict:
     """Parse a stub.cu file to extract problem name and signature."""
     # Extract problem name from first comment line like "* Problem: Vector Addition"
-    name_match = re.search(r'\* Problem: (.+)', stub_content)
+    name_match = re.search(r"\* Problem: (.+)", stub_content)
     name = name_match.group(1).strip() if name_match else "Unknown Problem"
 
     # Extract signature - look for __global__ void function declaration
-    sig_match = re.search(r'(__global__\s+void\s+\w+\s*\([^)]*\))', stub_content)
+    sig_match = re.search(r"(__global__\s+void\s+\w+\s*\([^)]*\))", stub_content)
     signature = sig_match.group(1).strip() if sig_match else ""
 
     return {"name": name, "expected_signature": signature}
@@ -79,7 +83,7 @@ def load_problems(problems_dir: str) -> dict:
         return problems
 
     for problem_dir in sorted(problems_path.iterdir()):
-        if not problem_dir.is_dir() or problem_dir.name.startswith('.'):
+        if not problem_dir.is_dir() or problem_dir.name.startswith("."):
             continue
 
         harness_path = problem_dir / "harness.cu"
@@ -177,12 +181,14 @@ int main() {{
 
 # --- Modal Functions ---
 
+
 @app.function(image=cuda_image, volumes={"/data": vol})
 def init_db():
     """Initialize the SQLite database."""
     import sqlite3
+
     os.makedirs("/data", exist_ok=True)
-    
+
     conn = sqlite3.connect(DB_PATH)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS submissions (
@@ -217,10 +223,10 @@ def init_db():
 )
 def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
     """Compile and benchmark a user's kernel submission."""
+    import hashlib
+    import sqlite3
     import subprocess
     import tempfile
-    import sqlite3
-    import hashlib
     from datetime import datetime
 
     problems = get_problems()
@@ -230,33 +236,33 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
             "error": "unknown_problem",
             "message": f"Problem '{problem_id}' not found. Available: {list(problems.keys())}",
         }
-    
+
     kernel_hash = hashlib.sha256(kernel_source.encode()).hexdigest()[:16]
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         kernel_path = os.path.join(tmpdir, "kernel.cu")
         binary_path = os.path.join(tmpdir, "kernel")
-        
+
         # Build full source with harness
         full_source = build_harness(problem_id, kernel_source)
-        
+
         with open(kernel_path, "w") as f:
             f.write(full_source)
-        
+
         # Compile
         compile_result = subprocess.run(
             ["nvcc", "-O3", "-arch=sm_75", "-o", binary_path, kernel_path],
             capture_output=True,
             text=True,
         )
-        
+
         if compile_result.returncode != 0:
             return {
                 "success": False,
                 "error": "compilation_failed",
                 "message": compile_result.stderr,
             }
-        
+
         # Run benchmark (multiple iterations)
         times = []
         for _ in range(10):
@@ -266,14 +272,14 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
                 text=True,
                 timeout=30,
             )
-            
+
             if result.returncode != 0:
                 return {
                     "success": False,
                     "error": "runtime_error",
                     "message": result.stderr or "Kernel execution failed",
                 }
-            
+
             try:
                 times.append(float(result.stdout.strip()))
             except ValueError:
@@ -282,19 +288,22 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
                     "error": "parse_error",
                     "message": f"Could not parse output: {result.stdout}",
                 }
-        
+
         median_time = sorted(times)[len(times) // 2]
-        
+
         # Record to database
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO submissions (problem_id, user_id, time_ms, kernel_hash, submitted_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (problem_id, user_id, median_time, kernel_hash, datetime.utcnow().isoformat()))
+        """,
+            (problem_id, user_id, median_time, kernel_hash, datetime.utcnow().isoformat()),
+        )
         conn.commit()
         conn.close()
         vol.commit()
-        
+
         return {
             "success": True,
             "time_ms": median_time,
@@ -315,7 +324,8 @@ def leaderboard(problem_id: str = None):
     conn.row_factory = sqlite3.Row
 
     if problem_id:
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT
                 user_id,
                 MIN(time_ms) as best_time_ms,
@@ -325,7 +335,9 @@ def leaderboard(problem_id: str = None):
             WHERE problem_id = ?
             GROUP BY user_id
             ORDER BY best_time_ms ASC
-        """, (problem_id,)).fetchall()
+        """,
+            (problem_id,),
+        ).fetchall()
 
         result = {
             "problem_id": problem_id,
@@ -351,7 +363,7 @@ def leaderboard(problem_id: str = None):
             FROM submissions
             GROUP BY problem_id
         """).fetchall()
-        
+
         result = {
             "problems": [
                 {
@@ -364,7 +376,7 @@ def leaderboard(problem_id: str = None):
                 for r in rows
             ],
         }
-    
+
     conn.close()
     return result
 
@@ -384,6 +396,32 @@ def problems():
             for pid, pdata in all_problems.items()
         ]
     }
+
+
+@app.function(image=cuda_image)
+@modal.fastapi_endpoint(method="GET")
+def stub(problem_id: str):
+    """Get the stub.cu content for a problem (for web editor)."""
+    probs = get_problems()
+    if problem_id not in probs:
+        return {"error": f"Problem '{problem_id}' not found"}
+
+    stub_path = Path(PROBLEMS_DIR) / problem_id / "stub.cu"
+    if stub_path.exists():
+        return {"stub": stub_path.read_text()}
+    return {"error": "Stub file not found"}
+
+
+@app.function(image=cuda_image)
+@modal.fastapi_endpoint(method="GET")
+def index():
+    """Serve the main web UI."""
+    from fastapi.responses import HTMLResponse
+
+    html_path = Path("/app/static/index.html")
+    if html_path.exists():
+        return HTMLResponse(content=html_path.read_text())
+    return HTMLResponse(content="<h1>Error: index.html not found</h1>", status_code=404)
 
 
 @app.function(
@@ -444,10 +482,10 @@ def submit(request: dict):
                 "message": "Invalid or missing API key",
             }
 
+    import hashlib
+    import sqlite3
     import subprocess
     import tempfile
-    import sqlite3
-    import hashlib
     from datetime import datetime
 
     problems = get_problems()
@@ -510,10 +548,13 @@ def submit(request: dict):
         median_time = sorted(times)[len(times) // 2]
 
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO submissions (problem_id, user_id, time_ms, kernel_hash, submitted_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (problem_id, user_id, median_time, kernel_hash, datetime.utcnow().isoformat()))
+        """,
+            (problem_id, user_id, median_time, kernel_hash, datetime.utcnow().isoformat()),
+        )
         conn.commit()
         conn.close()
         vol.commit()
@@ -529,6 +570,7 @@ def submit(request: dict):
 
 
 # --- Local entrypoint for testing ---
+
 
 @app.local_entrypoint()
 def main(action: str = "test", problem: str = "01_vectoradd"):
