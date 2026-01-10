@@ -654,24 +654,23 @@
             filenameTab.textContent = `${problemId}.cu`;
             submitBtn.disabled = false;
 
-            // Load stub
+            // Fetch stub and leaderboard IN PARALLEL for better performance
             try {
-                const data = await fetchApi(`stub?problem_id=${problemId}`);
-                if (data.stub) {
-                    originalStub = data.stub;
-                    setEditorContent(data.stub);
+                const [stubData, _] = await Promise.all([
+                    fetchApi(`stub?problem_id=${problemId}`),
+                    loadLeaderboard(problemId)
+                ]);
 
-                    // Parse and display problem info
-                    renderProblemInfo(data.stub);
+                if (stubData.stub) {
+                    originalStub = stubData.stub;
+                    setEditorContent(stubData.stub);
+                    renderProblemInfo(stubData.stub);
                 } else {
-                    log('Failed to load stub: ' + (data.error || 'Unknown error'), 'error');
+                    log('Failed to load stub: ' + (stubData.error || 'Unknown error'), 'error');
                 }
             } catch (error) {
-                log('Failed to load stub: ' + error.message, 'error');
+                log('Failed to load problem: ' + error.message, 'error');
             }
-
-            // Load leaderboard
-            await loadLeaderboard(problemId);
         }
 
         function renderProblemInfo(stubContent) {

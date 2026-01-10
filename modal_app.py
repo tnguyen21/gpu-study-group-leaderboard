@@ -368,6 +368,8 @@ def leaderboard(problem_id: str = None):
     """Get leaderboard data as JSON."""
     import sqlite3
 
+    from fastapi.responses import JSONResponse
+
     problems = get_problems()
     vol.reload()  # Get latest data from other containers
     conn = sqlite3.connect(DB_PATH)
@@ -405,7 +407,7 @@ def leaderboard(problem_id: str = None):
         }
     else:
         rows = conn.execute("""
-            SELECT 
+            SELECT
                 problem_id,
                 COUNT(DISTINCT user_id) as participants,
                 COUNT(*) as total_submissions,
@@ -428,15 +430,18 @@ def leaderboard(problem_id: str = None):
         }
 
     conn.close()
-    return result
+    # Cache for 10 seconds - leaderboard updates frequently
+    return JSONResponse(content=result, headers={"Cache-Control": "public, max-age=10"})
 
 
 @app.function(image=cuda_image, volumes={"/data": vol})
 @modal.fastapi_endpoint(method="GET")
 def problems():
     """List available problems."""
+    from fastapi.responses import JSONResponse
+
     all_problems = get_problems()
-    return {
+    data = {
         "problems": [
             {
                 "id": pid,
@@ -446,20 +451,30 @@ def problems():
             for pid, pdata in all_problems.items()
         ]
     }
+    # Cache for 1 day - problems only change on redeployment
+    return JSONResponse(content=data, headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.function(image=cuda_image)
 @modal.fastapi_endpoint(method="GET")
 def stub(problem_id: str):
     """Get the stub.cu content for a problem (for web editor)."""
+    from fastapi.responses import JSONResponse
+
     probs = get_problems()
     if problem_id not in probs:
-        return {"error": f"Problem '{problem_id}' not found"}
+        return JSONResponse(
+            content={"error": f"Problem '{problem_id}' not found"}, status_code=404
+        )
 
     stub_path = Path(PROBLEMS_DIR) / problem_id / "stub.cu"
     if stub_path.exists():
-        return {"stub": stub_path.read_text()}
-    return {"error": "Stub file not found"}
+        # Cache for 7 days - stubs never change between deployments
+        return JSONResponse(
+            content={"stub": stub_path.read_text()},
+            headers={"Cache-Control": "public, max-age=604800"},
+        )
+    return JSONResponse(content={"error": "Stub file not found"}, status_code=404)
 
 
 @app.function(image=cuda_image)
@@ -536,27 +551,7 @@ def submit(request: dict):
     import sqlite3
     import subprocess
     import tempfile
-    from datetime import datetime, timedelta
-
-    # Security: Rate limiting - check last submission time for this user
-    vol.reload()
-    conn = sqlite3.connect(DB_PATH)
-    last_submit = conn.execute(
-        "SELECT submitted_at FROM submissions WHERE user_id = ? ORDER BY submitted_at DESC LIMIT 1",
-        (user_id,),
-    ).fetchone()
-    conn.close()
-
-    if last_submit:
-        last_time = datetime.fromisoformat(last_submit[0])
-        cooldown = timedelta(seconds=30)
-        if datetime.utcnow() - last_time < cooldown:
-            remaining = int((cooldown - (datetime.utcnow() - last_time)).total_seconds())
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "message": f"Please wait {remaining}s before submitting again",
-            }
+    from datetime import datetime
 
     problems = get_problems()
     if problem_id not in problems:
