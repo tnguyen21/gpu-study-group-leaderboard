@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modal-leaderboard"
+version = "0.1.0"
+description = "A Modal-based GPU kernel benchmarking system for learning CUDA"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "modal>=0.66.0",
+    "requests>=2.31.0",
+]
+
+[tool.setuptools]
+py-modules = ["submit", "modal_app"]
+
+[project.scripts]
+submit = "submit:main"
+
+[tool.ruff]
+line-length = 144
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
