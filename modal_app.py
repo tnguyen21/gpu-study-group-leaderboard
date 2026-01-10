@@ -324,10 +324,16 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
             )
 
             if result.returncode != 0:
+                # Include both stdout and stderr for better debugging
+                error_details = []
+                if result.stderr:
+                    error_details.append(sanitize_error_message(result.stderr))
+                if result.stdout:
+                    error_details.append(sanitize_error_message(result.stdout))
                 return {
                     "success": False,
                     "error": "runtime_error",
-                    "message": sanitize_error_message(result.stderr) or "Kernel execution failed",
+                    "message": "\n".join(error_details) or "Kernel execution failed (no output)",
                 }
 
             try:
@@ -608,10 +614,16 @@ def submit(request: dict):
             )
 
             if result.returncode != 0:
+                # Include both stdout and stderr for better debugging
+                error_details = []
+                if result.stderr:
+                    error_details.append(sanitize_error_message(result.stderr))
+                if result.stdout:
+                    error_details.append(sanitize_error_message(result.stdout))
                 return {
                     "success": False,
                     "error": "runtime_error",
-                    "message": sanitize_error_message(result.stderr) or "Kernel execution failed",
+                    "message": "\n".join(error_details) or "Kernel execution failed (no output)",
                 }
 
             try:

@@ -31,7 +31,12 @@ vectorAdd<<<(N + 255) / 256, 256>>>(d_a, d_b, d_c, N);
 cudaMemcpy(h_c, d_c, N * sizeof(float), cudaMemcpyDeviceToHost);
 int errors = 0;
 for (int i = 0; i < N; i++) {
-    if (fabs(h_c[i] - h_ref[i]) > 1e-5) errors++;
+    if (fabs(h_c[i] - h_ref[i]) > 1e-5) {
+        errors++;
+        if (errors <= 5) {
+            fprintf(stderr, "Mismatch at %d: got %f, expected %f\n", i, h_c[i], h_ref[i]);
+        }
+    }
 }
 if (errors > 0) {
     fprintf(stderr, "Validation failed: %d errors\n", errors);
