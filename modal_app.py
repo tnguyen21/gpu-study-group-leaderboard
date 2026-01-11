@@ -319,6 +319,83 @@ def validate_submission_inputs(problem_id: str, user_id: str, kernel_source: str
     return True, "", ""
 
 
+def _strip_c_comments(s: str) -> str:
+    s = re.sub(r"/\\*.*?\\*/", "", s, flags=re.DOTALL)
+    s = re.sub(r"//.*?$", "", s, flags=re.MULTILINE)
+    return s
+
+
+def _split_c_params(params: str) -> list[str]:
+    params = params.strip()
+    if not params:
+        return []
+    # Good enough for our problem signatures (no templates/function pointers).
+    return [p.strip() for p in params.split(",") if p.strip()]
+
+
+_C_QUALIFIERS_RE = re.compile(r"\\b(const|volatile|restrict|__restrict__|__restrict)\\b")
+
+
+def _canonicalize_c_param_type(param: str) -> str:
+    param = _strip_c_comments(param)
+    param = param.split("=", 1)[0].strip()
+    param = _C_QUALIFIERS_RE.sub("", param)
+    param = re.sub(r"\\s+", " ", param).strip()
+
+    # Drop the parameter name (keep just the type-ish prefix).
+    m = re.match(r"^(.*?)(?:\\b[A-Za-z_]\\w*\\b)\\s*(?:\\[[^\\]]*\\]\\s*)*$", param)
+    if m:
+        prefix = (m.group(1) or "").strip()
+        if prefix:
+            param = prefix
+
+    return param.replace(" ", "")
+
+
+def _parse_expected_signature(expected_signature: str) -> tuple[str, list[str]] | None:
+    expected_signature = _strip_c_comments(expected_signature).strip().rstrip(";")
+    m = re.search(r"__global__\\s+void\\s+([A-Za-z_]\\w*)\\s*\\(([^)]*)\\)", expected_signature)
+    if not m:
+        return None
+    name = m.group(1)
+    params = [_canonicalize_c_param_type(p) for p in _split_c_params(m.group(2))]
+    return name, params
+
+
+def _extract_kernel_signature_from_source(kernel_source: str, kernel_name: str) -> list[str] | None:
+    kernel_source = _strip_c_comments(kernel_source)
+    m = re.search(rf"__global__\\s+void\\s+{re.escape(kernel_name)}\\s*\\(([^)]*)\\)", kernel_source)
+    if not m:
+        return None
+    return [_canonicalize_c_param_type(p) for p in _split_c_params(m.group(1))]
+
+
+def validate_kernel_signature(problem_id: str, kernel_source: str) -> tuple[bool, str, str]:
+    problems = get_problems()
+    expected_signature = (problems.get(problem_id, {}) or {}).get("expected_signature") or ""
+    expected_signature = str(expected_signature).strip()
+    if not expected_signature:
+        return True, "", ""
+
+    parsed = _parse_expected_signature(expected_signature)
+    if parsed is None:
+        # Don't hard-fail if a problem stub doesn't include a parsable signature.
+        return True, "", ""
+
+    expected_name, expected_params = parsed
+    actual_params = _extract_kernel_signature_from_source(kernel_source, expected_name)
+    if actual_params is None:
+        m = re.search(r"__global__\\s+void\\s+([A-Za-z_]\\w*)\\s*\\(", _strip_c_comments(kernel_source))
+        found = m.group(1) if m else None
+        hint = f" Found kernel '{found}'." if found and found != expected_name else ""
+        return False, "signature_mismatch", f"Kernel must define `{expected_signature}`.{hint}"
+
+    if actual_params != expected_params:
+        return False, "signature_mismatch", f"Kernel signature does not match stub. Expected `{expected_signature}`."
+
+    return True, "", ""
+
+
 def run_limited_subprocess(
     *,
     args: list[str],
@@ -507,6 +584,10 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
             "error": "unknown_problem",
             "message": f"Problem '{problem_id}' not found. Available: {list(problems.keys())}",
         }
+
+    ok, err, msg = validate_kernel_signature(problem_id, kernel_source)
+    if not ok:
+        return {"success": False, "error": err, "message": msg}
 
     # Security: Validate kernel source for dangerous patterns
     is_valid, validation_error = validate_kernel_source(kernel_source)
@@ -1047,6 +1128,14 @@ def web():
         if not ok:
             return {"success": False, "error": err, "message": msg}
 
+        problems = get_problems()
+        if problem_id not in problems:
+            return {
+                "success": False,
+                "error": "unknown_problem",
+                "message": f"Problem '{problem_id}' not found.",
+            }
+
         if SUBMIT_API_KEY is not None:
             provided_key = request.get("api_key")
             if provided_key != SUBMIT_API_KEY:
@@ -1076,6 +1165,10 @@ def web():
                 "error": "unauthorized",
                 "message": "Login required (invalid token).",
             }
+
+        ok, err, msg = validate_kernel_signature(problem_id, kernel_source)
+        if not ok:
+            return {"success": False, "error": err, "message": msg}
 
         result = benchmark_kernel.remote(problem_id, user_id, kernel_source)
         if not result.get("success"):

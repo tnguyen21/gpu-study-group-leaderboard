@@ -4,6 +4,10 @@ Kernel Leaderboard Submission Script
 
 Usage:
     python submit.py submit <problem_id> <kernel_file> --url <leaderboard_url> [--user <username>]
+    python submit.py signup --url <leaderboard_url> --user <username> --password <password>
+    python submit.py login --url <leaderboard_url> --user <username> --password <password>
+    python submit.py logout --url <leaderboard_url>
+    python submit.py whoami --url <leaderboard_url>
 
 Example:
     python submit.py submit week01_vectoradd my_vectoradd.cu --url https://... --user tommy
@@ -100,6 +104,19 @@ def _load_saved_token(token_path: pathlib.Path, base_url: str) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
+def _load_saved_auth(token_path: pathlib.Path, base_url: str) -> dict[str, Any] | None:
+    try:
+        raw = token_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("url") != base_url:
+        return None
+    return data  # type: ignore[return-value]
+
+
 def _save_token(token_path: pathlib.Path, *, base_url: str, user_id: str | None, token: str) -> None:
     token_path.parent.mkdir(parents=True, exist_ok=True)
     data = {"url": base_url, "user_id": user_id, "token": token}
@@ -120,9 +137,47 @@ def login(*, base_url: str, user_id: str, password: str, token_path: pathlib.Pat
         raise RuntimeError("Login response did not include a token")
 
     if token_path is not None:
-        _save_token(token_path, base_url=base_url, user_id=user_id, token=token)
+        resolved_user_id = resp.get("user_id") if isinstance(resp.get("user_id"), str) else user_id
+        _save_token(token_path, base_url=base_url, user_id=resolved_user_id, token=token)
 
     return token
+
+
+def signup(*, base_url: str, user_id: str, password: str) -> dict[str, Any]:
+    return _http_json(f"{base_url}/signup", method="POST", data={"user_id": user_id, "password": password})
+
+
+def logout(*, base_url: str, token: str, token_path: pathlib.Path | None) -> None:
+    resp = _http_json(f"{base_url}/logout", method="POST", data={"token": token})
+    if not resp.get("success"):
+        msg = resp.get("message") or resp.get("error") or "Logout failed"
+        raise RuntimeError(str(msg))
+
+    if token_path is not None:
+        saved = _load_saved_auth(token_path, base_url)
+        if saved and saved.get("token") == token:
+            try:
+                token_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def whoami(*, base_url: str, token: str | None, token_path: pathlib.Path | None, fallback_user: str | None) -> None:
+    user_id = None
+    saved_token = None
+    if token_path is not None:
+        saved = _load_saved_auth(token_path, base_url)
+        if saved:
+            saved_token = saved.get("token") if isinstance(saved.get("token"), str) else None
+            user_id = saved.get("user_id") if isinstance(saved.get("user_id"), str) else None
+    if not user_id:
+        user_id = fallback_user
+
+    active_token = token or saved_token
+    token_hint = f"{active_token[:8]}…" if isinstance(active_token, str) and active_token else "none"
+    print(f"url:  {base_url}")
+    print(f"user: {user_id or 'unknown'}")
+    print(f"token: {token_hint}")
 
 
 def submit(*, base_url: str, problem_id: str, kernel_file: str, token: str, api_key: str | None) -> None:
@@ -219,9 +274,12 @@ def main() -> None:
 
     subparsers.add_parser("list", help="List available problems", parents=[common])
     subparsers.add_parser("login", help="Log in and save a token", parents=[common])
+    subparsers.add_parser("signup", help="Create an account and save a token", parents=[common])
+    subparsers.add_parser("logout", help="Invalidate the current token", parents=[common])
+    subparsers.add_parser("whoami", help="Show saved auth info", parents=[common], aliases=["me"])
 
     argv = sys.argv[1:]
-    commands = {"submit", "list", "login"}
+    commands = {"submit", "list", "login", "signup", "logout", "whoami", "me"}
     value_flags = {
         "--url",
         "--token-file",
@@ -250,7 +308,8 @@ def main() -> None:
     base_url = _resolve_base_url(args.url)
     if not base_url:
         print("Error: leaderboard URL not set.")
-        print("Pass `--url https://...` or set `LEADERBOARD_URL` (or deploy and authenticate with Modal).")
+        print("Pass `--url https://...-web.modal.run` or set `LEADERBOARD_URL`.")
+        print("Tip: after `modal deploy modal_app.py`, run `modal app list` to find the web endpoint URL.")
         raise SystemExit(2)
 
     token_path = pathlib.Path(args.token_file).expanduser()
@@ -263,6 +322,19 @@ def main() -> None:
             print("Provide `--token` / `LEADERBOARD_TOKEN`, or `--user` + `--password` to log in.")
             raise SystemExit(2)
         token = login(base_url=base_url, user_id=args.user, password=args.password, token_path=token_path)
+
+    if args.command == "signup":
+        if not args.user or not args.password:
+            print("Error: `signup` requires `--user` and `--password` (or LEADERBOARD_USER/LEADERBOARD_PASSWORD).")
+            raise SystemExit(2)
+        resp = signup(base_url=base_url, user_id=args.user, password=args.password)
+        if not resp.get("success"):
+            msg = resp.get("message") or resp.get("error") or "Signup failed"
+            print(f"Error: {msg}")
+            raise SystemExit(1)
+        token = login(base_url=base_url, user_id=args.user, password=args.password, token_path=token_path)
+        print(token)
+        return
 
     if args.command == "submit":
         assert token is not None
@@ -282,6 +354,23 @@ def main() -> None:
     if args.command == "login":
         assert token is not None
         print(token)
+        return
+
+    if args.command == "logout":
+        if not token:
+            print("Error: no session token available to log out.")
+            print("Provide `--token` / `LEADERBOARD_TOKEN`, or ensure you have a saved token in --token-file.")
+            raise SystemExit(2)
+        try:
+            logout(base_url=base_url, token=token, token_path=token_path)
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            raise SystemExit(1)
+        print("ok")
+        return
+
+    if args.command in ("whoami", "me"):
+        whoami(base_url=base_url, token=args.token, token_path=token_path, fallback_user=args.user)
         return
 
     parser.print_help()
