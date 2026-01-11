@@ -1,39 +1,21 @@
 /*
  * Problem: Tiled Matrix Multiplication
- * PMPP Chapter 5-6
+ * Compute matrix product `C = A * B` (same math as `02_matmul_naive`).
  *
- * Compute C = A * B using shared memory tiling.
+ * Shapes:
+ *   - `A`: M x K (row-major)
+ *   - `B`: K x N (row-major)
+ *   - `C`: M x N (row-major)
  *
- * This is the same computation as 02_matmul_naive, but now you should
- * use shared memory to reduce global memory accesses.
+ * Definition:
+ *   - `C[row, col] = sum_{k=0..K-1} A[row, k] * B[k, col]`
  *
- * Input:
- *   - A: input matrix (M x K = 1024 x 1024)
- *   - B: input matrix (K x N = 1024 x 1024)
- *   - M, N, K: matrix dimensions
- *
- * Output:
- *   - C: output matrix (M x N = 1024 x 1024)
- *
- * Key concepts:
- *   - Shared memory (__shared__ keyword)
- *   - Tiling: load a tile of A and B into shared memory
- *   - __syncthreads() to synchronize threads within a block
- *   - Boundary checking for tiles at matrix edges
- *
- * The naive implementation reads each element of A and B from global
- * memory K times. With tiling, each element is read once per tile,
- * reducing global memory accesses by a factor of TILE_WIDTH.
- *
- * Optimization ideas:
- *   - Different tile sizes (16x16, 32x32)
- *   - Thread coarsening (each thread computes multiple outputs)
- *   - Register tiling
+ * Example:
+ *   - A (2x3) = [[1,2,3],[4,5,6]]
+ *   - B (3x2) = [[7,8],[9,10],[11,12]]
+ *   - C (2x2) = [[58,64],[139,154]]
  */
-
-#define TILE_WIDTH 16
 
 __global__ void matmul(float *A, float *B, float *C, int M, int N, int K) {
     // Your implementation here
-    // Hint: Use __shared__ float As[TILE_WIDTH][TILE_WIDTH];
 }

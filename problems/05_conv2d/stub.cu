@@ -1,30 +1,22 @@
 /*
  * Problem: 2D Convolution
- * PMPP Chapter 7
+ * Apply a 2D convolution to a 2D image.
  *
- * Apply a 2D convolution filter to an image.
+ * Inputs:
+ *   - `input`: height x width (row-major)
+ *   - `filter`: (2*r+1) x (2*r+1) (row-major)
+ *   - `r`: filter radius
  *
- * Input:
- *   - input: input image (height x width floats)
- *   - filter: convolution kernel ((2*r+1) x (2*r+1) floats)
- *   - output: output image (height x width floats)
- *   - width, height: image dimensions (1024 x 1024)
- *   - r: filter radius (r=3 means 7x7 filter)
+ * Output:
+ *   - `output`: height x width (row-major)
  *
- * For each output pixel, compute the weighted sum of the input pixels
- * in its neighborhood, where weights come from the filter.
+ * Definition (out-of-bounds treated as 0):
+ *   - output[row,col] = sum_{fr=0..2r} sum_{fc=0..2r}
+ *       input[row - r + fr, col - r + fc] * filter[fr,fc]
  *
- * Boundary handling: pixels outside the image are treated as 0.
- *
- * Key concepts:
- *   - Halo cells: extra border pixels needed for convolution
- *   - Constant memory for filter coefficients (cached, broadcast)
- *   - Shared memory tiling with halo handling
- *
- * Optimization ideas:
- *   - Use constant memory for the filter (__constant__)
- *   - Tile the input into shared memory (including halos)
- *   - L2 cache for halo elements outside the tile
+ * Example (r=1, filter all 1s):
+ *   - input (3x3) = [[1,2,3],[4,5,6],[7,8,9]]
+ *   - output[1,1] = 45, output[0,0] = 12
  */
 
 __global__ void conv2d(float *input, float *filter, float *output,

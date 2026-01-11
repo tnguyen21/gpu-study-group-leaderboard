@@ -1,37 +1,20 @@
 /*
  * Problem: Parallel Merge
- * PMPP Chapter 12
+ * Merge two sorted arrays into one sorted array.
  *
- * Merge two sorted arrays A and B into a single sorted array C.
- *
- * Input:
- *   - A: sorted array of m floats (m = 500,000)
- *   - B: sorted array of n floats (n = 500,000)
- *   - m, n: sizes of input arrays
+ * Inputs:
+ *   - `A`: sorted array of length `m`
+ *   - `B`: sorted array of length `n`
  *
  * Output:
- *   - C: merged sorted array of (m + n) floats
+ *   - `C`: sorted array of length `m + n` containing all elements of `A` and `B`
  *
- * Key concepts:
- *   - Co-rank function: given output index k, find (i, j) where
- *     i + j = k and A[0..i-1], B[0..j-1] are the elements before C[k]
- *   - Binary search to find co-rank in O(log(min(m,n))) time
- *   - Each thread independently merges its portion using co-rank
+ * Tie-breaking:
+ *   - If `A[i] == B[j]`, place `A[i]` before `B[j]` (stable w.r.t. `A` first).
  *
- * Challenge: dividing work evenly among threads when A and B
- * have different distributions of values.
- *
- * Optimization ideas:
- *   - Tiled merge: load tiles into shared memory
- *   - Reduce global memory binary searches
- *   - Better load balancing
+ * Example:
+ *   - A = [0.5, 2.5, 4.5], B = [0, 2, 4] -> C = [0, 0.5, 2, 2.5, 4, 4.5]
  */
-
-// Helper: find co-rank for output position k
-__device__ int co_rank(int k, float *A, int m, float *B, int n);
-
-// Helper: sequential merge of small arrays
-__device__ void merge_sequential(float *A, int m, float *B, int n, float *C);
 
 __global__ void merge(float *A, int m, float *B, int n, float *C) {
     // Your implementation here

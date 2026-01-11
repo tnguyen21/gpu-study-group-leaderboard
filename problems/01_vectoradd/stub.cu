@@ -1,26 +1,16 @@
 /*
  * Problem: Vector Addition
- * PMPP Chapter 2-3
+ * Compute `c[i] = a[i] + b[i]` for `i in [0, n)`.
  *
- * Add two vectors element-wise: c[i] = a[i] + b[i]
- *
- * Input:
- *   - a: input vector of N floats
- *   - b: input vector of N floats
- *   - n: number of elements (N = 1,048,576 = 2^20)
+ * Inputs:
+ *   - `a`, `b`: arrays of length `n`
+ *   - `n`: number of elements
  *
  * Output:
- *   - c: output vector where c[i] = a[i] + b[i]
+ *   - `c`: array of length `n`
  *
- * Key concepts:
- *   - Thread indexing: blockIdx.x * blockDim.x + threadIdx.x
- *   - Bounds checking for when N isn't a multiple of block size
- *   - Memory coalescing (threads access consecutive memory)
- *
- * Optimization ideas:
- *   - Vectorized loads/stores (float4) to increase memory throughput
- *   - Loop unrolling to hide latency
- *   - Experiment with different block sizes (128, 256, 512, 1024)
+ * Example:
+ *   - a = [1, 2, 3], b = [10, 20, 30]  ->  c = [11, 22, 33]
  */
 
 __global__ void vectorAdd(float *a, float *b, float *c, int n) {
