@@ -564,7 +564,7 @@ def record_submission(problem_id: str, user_id: str, time_ms: float, kernel_hash
 @app.function(
     image=cuda_image,
     gpu="T4",
-    timeout=120,
+    timeout=180,
     max_containers=3,  # Prevent abuse
 )
 def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
@@ -645,7 +645,7 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
             safe_env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
 
         times = []
-        for _ in range(10):
+        for _ in range(5):
             returncode, output, timed_out = run_limited_subprocess(
                 args=[binary_path],
                 cwd=tmpdir,

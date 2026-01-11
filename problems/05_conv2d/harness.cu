@@ -2,6 +2,94 @@
 // This file is parsed by modal_app.py to build the benchmark
 
 // === SETUP ===
+// Validation tests on critical edge cases
+{
+    // {WIDTH, HEIGHT, R (filter radius)}
+    int test_cases[][3] = {
+        {800, 600, 3},      // Non-square
+        {33, 17, 2},        // Small primes
+        {100, 100, 1},      // Small with 3x3 filter
+    };
+    int num_tests = sizeof(test_cases) / sizeof(test_cases[0]);
+
+    for (int t = 0; t < num_tests; t++) {
+        int WIDTH = test_cases[t][0];
+        int HEIGHT = test_cases[t][1];
+        int R = test_cases[t][2];
+        int FILTER_SIZE = (2 * R + 1) * (2 * R + 1);
+
+        float *t_h_input = (float*)malloc(WIDTH * HEIGHT * sizeof(float));
+        float *t_h_output = (float*)malloc(WIDTH * HEIGHT * sizeof(float));
+        float *t_h_filter = (float*)malloc(FILTER_SIZE * sizeof(float));
+        float *t_h_ref = (float*)malloc(WIDTH * HEIGHT * sizeof(float));
+        float *t_d_input, *t_d_output, *t_d_filter;
+
+        for (int i = 0; i < WIDTH * HEIGHT; i++) {
+            t_h_input[i] = (i % 256) / 255.0f;
+        }
+
+        float filter_sum = 0.0f;
+        for (int i = 0; i < 2 * R + 1; i++) {
+            for (int j = 0; j < 2 * R + 1; j++) {
+                float di = i - R;
+                float dj = j - R;
+                t_h_filter[i * (2 * R + 1) + j] = expf(-(di*di + dj*dj) / (2.0f * (R + 0.5f)));
+                filter_sum += t_h_filter[i * (2 * R + 1) + j];
+            }
+        }
+        for (int i = 0; i < FILTER_SIZE; i++) {
+            t_h_filter[i] /= filter_sum;
+        }
+
+        for (int row = 0; row < HEIGHT; row++) {
+            for (int col = 0; col < WIDTH; col++) {
+                float sum = 0.0f;
+                for (int fr = 0; fr < 2 * R + 1; fr++) {
+                    for (int fc = 0; fc < 2 * R + 1; fc++) {
+                        int in_row = row - R + fr;
+                        int in_col = col - R + fc;
+                        if (in_row >= 0 && in_row < HEIGHT && in_col >= 0 && in_col < WIDTH) {
+                            sum += t_h_input[in_row * WIDTH + in_col] * t_h_filter[fr * (2 * R + 1) + fc];
+                        }
+                    }
+                }
+                t_h_ref[row * WIDTH + col] = sum;
+            }
+        }
+
+        cudaMalloc(&t_d_input, WIDTH * HEIGHT * sizeof(float));
+        cudaMalloc(&t_d_output, WIDTH * HEIGHT * sizeof(float));
+        cudaMalloc(&t_d_filter, FILTER_SIZE * sizeof(float));
+
+        cudaMemcpy(t_d_input, t_h_input, WIDTH * HEIGHT * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(t_d_filter, t_h_filter, FILTER_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+
+        dim3 block(16, 16);
+        dim3 grid((WIDTH + 15) / 16, (HEIGHT + 15) / 16);
+        conv2d<<<grid, block>>>(t_d_input, t_d_filter, t_d_output, WIDTH, HEIGHT, R);
+
+        cudaMemcpy(t_h_output, t_d_output, WIDTH * HEIGHT * sizeof(float), cudaMemcpyDeviceToHost);
+        int errors = 0;
+        for (int i = 0; i < WIDTH * HEIGHT; i++) {
+            if (fabs(t_h_output[i] - t_h_ref[i]) > 1e-4) {
+                errors++;
+                if (errors <= 5) {
+                    fprintf(stderr, "Test %d (%dx%d, R=%d): Mismatch at %d: got %f, expected %f\n",
+                            t, WIDTH, HEIGHT, R, i, t_h_output[i], t_h_ref[i]);
+                }
+            }
+        }
+        if (errors > 0) {
+            fprintf(stderr, "Test %d (%dx%d, R=%d): Validation failed with %d errors\n", t, WIDTH, HEIGHT, R, errors);
+            return 1;
+        }
+
+        cudaFree(t_d_input); cudaFree(t_d_output); cudaFree(t_d_filter);
+        free(t_h_input); free(t_h_output); free(t_h_filter); free(t_h_ref);
+    }
+}
+
+// Main test case for timing
 const int WIDTH = 1024;
 const int HEIGHT = 1024;
 const int R = 3;  // Filter radius (7x7 filter)
