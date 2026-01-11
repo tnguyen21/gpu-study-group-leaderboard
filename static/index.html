@@ -24,6 +24,10 @@
             --error: #f87171;
             --warning: #fbbf24;
             --border: #2a2a4a;
+
+            --sidebar-width: 320px;
+            --console-height: 220px;
+            --splitter-size: 6px;
         }
 
         body {
@@ -95,13 +99,46 @@
 
         /* Sidebar */
         .sidebar {
-            width: 280px;
-            min-width: 280px;
+            width: var(--sidebar-width);
+            min-width: 240px;
+            max-width: 560px;
             background: var(--bg-sidebar);
             border-right: 1px solid var(--border);
             display: flex;
             flex-direction: column;
             overflow: hidden;
+        }
+
+        .splitter {
+            background: transparent;
+            flex-shrink: 0;
+        }
+
+        .splitter-vertical {
+            width: var(--splitter-size);
+            cursor: col-resize;
+            border-left: 1px solid var(--border);
+            border-right: 1px solid transparent;
+        }
+
+        .splitter-vertical:hover {
+            border-left-color: var(--accent);
+        }
+
+        .splitter-horizontal {
+            height: var(--splitter-size);
+            cursor: row-resize;
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid transparent;
+        }
+
+        .splitter-horizontal:hover {
+            border-top-color: var(--accent);
+        }
+
+        body.resizing {
+            user-select: none;
+            cursor: default;
         }
 
         .sidebar-section {
@@ -209,7 +246,7 @@
         .leaderboard-time {
             color: var(--success);
             font-family: monospace;
-            width: 110px;
+            width: 96px;
             text-align: right;
         }
 
@@ -321,7 +358,7 @@
 
         /* Console */
         .console-container {
-            height: 180px;
+            height: var(--console-height);
             min-height: 100px;
             background: var(--bg-dark);
             border-top: 1px solid var(--border);
@@ -575,7 +612,7 @@
     </div>
 
     <div class="main-container">
-        <aside class="sidebar">
+        <aside class="sidebar" id="sidebar">
             <div class="sidebar-section">
                 <h3>Problems</h3>
                 <ul class="problem-list" id="problem-list">
@@ -596,6 +633,8 @@
             </div>
         </aside>
 
+        <div class="splitter splitter-vertical" id="sidebar-splitter" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
+
         <main class="editor-container">
             <div class="editor-header">
                 <div class="editor-tabs">
@@ -608,6 +647,8 @@
             </div>
 
             <div class="editor-wrapper" id="editor"></div>
+
+            <div class="splitter splitter-horizontal" id="console-splitter" role="separator" aria-orientation="horizontal" title="Drag to resize"></div>
 
             <div class="console-container">
                 <div class="console-header">
@@ -666,6 +707,10 @@
         const submissionLoad = document.getElementById('submission-load');
         const submissionTitle = document.getElementById('submission-title');
         const submissionCode = document.getElementById('submission-code');
+        const sidebar = document.getElementById('sidebar');
+        const sidebarSplitter = document.getElementById('sidebar-splitter');
+        const consoleContainer = document.querySelector('.console-container');
+        const consoleSplitter = document.getElementById('console-splitter');
 
         let activeSubmission = null;
 
@@ -845,6 +890,89 @@
                     closeProfile();
                     closeSubmissionModal();
                 }
+            });
+
+            setupSplitters();
+        }
+
+        function clamp(value, min, max) {
+            return Math.min(max, Math.max(min, value));
+        }
+
+        function setSidebarWidthPx(px, { persist = true } = {}) {
+            const clamped = clamp(Math.round(px), 240, 560);
+            document.documentElement.style.setProperty('--sidebar-width', `${clamped}px`);
+            if (persist) localStorage.setItem('leaderboard_sidebar_width', String(clamped));
+        }
+
+        function getConsoleMaxHeightPx() {
+            const container = document.querySelector('.editor-container');
+            const header = document.querySelector('.editor-header');
+            if (!container || !header) return 520;
+            const containerH = container.getBoundingClientRect().height;
+            const headerH = header.getBoundingClientRect().height;
+            const minEditorPx = 160;
+            const splittersPx = 6;
+            return Math.max(140, Math.floor(containerH - headerH - minEditorPx - splittersPx));
+        }
+
+        function setConsoleHeightPx(px, { persist = true } = {}) {
+            const maxH = getConsoleMaxHeightPx();
+            const clamped = clamp(Math.round(px), 140, maxH);
+            document.documentElement.style.setProperty('--console-height', `${clamped}px`);
+            if (persist) localStorage.setItem('leaderboard_console_height', String(clamped));
+        }
+
+        function setupSplitters() {
+            const savedSidebar = Number(localStorage.getItem('leaderboard_sidebar_width'));
+            if (Number.isFinite(savedSidebar) && savedSidebar > 0) setSidebarWidthPx(savedSidebar, { persist: false });
+
+            const savedConsole = Number(localStorage.getItem('leaderboard_console_height'));
+            if (Number.isFinite(savedConsole) && savedConsole > 0) setConsoleHeightPx(savedConsole, { persist: false });
+
+            sidebarSplitter.addEventListener('pointerdown', (e) => {
+                e.preventDefault();
+                document.body.classList.add('resizing');
+                sidebarSplitter.setPointerCapture(e.pointerId);
+                const startX = e.clientX;
+                const startW = sidebar.getBoundingClientRect().width;
+
+                const onMove = (ev) => {
+                    const delta = ev.clientX - startX;
+                    setSidebarWidthPx(startW + delta);
+                };
+                const onUp = () => {
+                    document.body.classList.remove('resizing');
+                    window.removeEventListener('pointermove', onMove);
+                    window.removeEventListener('pointerup', onUp);
+                };
+                window.addEventListener('pointermove', onMove);
+                window.addEventListener('pointerup', onUp, { once: true });
+            });
+
+            consoleSplitter.addEventListener('pointerdown', (e) => {
+                e.preventDefault();
+                document.body.classList.add('resizing');
+                consoleSplitter.setPointerCapture(e.pointerId);
+                const startY = e.clientY;
+                const startH = consoleContainer.getBoundingClientRect().height;
+
+                const onMove = (ev) => {
+                    const delta = ev.clientY - startY;
+                    setConsoleHeightPx(startH - delta);
+                };
+                const onUp = () => {
+                    document.body.classList.remove('resizing');
+                    window.removeEventListener('pointermove', onMove);
+                    window.removeEventListener('pointerup', onUp);
+                };
+                window.addEventListener('pointermove', onMove);
+                window.addEventListener('pointerup', onUp, { once: true });
+            });
+
+            window.addEventListener('resize', () => {
+                const current = Number.parseInt(getComputedStyle(document.documentElement).getPropertyValue('--console-height'), 10);
+                if (Number.isFinite(current)) setConsoleHeightPx(current);
             });
         }
 
