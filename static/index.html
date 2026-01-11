@@ -227,40 +227,20 @@
             font-weight: 500;
         }
 
-        .problem-info {
-            flex: 1;
-            overflow-y: auto;
-        }
-
-        .problem-name {
-            font-size: 1.2rem;
-            font-weight: 600;
-            margin-bottom: 0.5rem;
-            color: var(--text);
-        }
-
-        .problem-chapter {
-            font-size: 1rem;
-            color: var(--accent);
-            margin-bottom: 0.75rem;
-        }
-
-        .problem-description {
-            font-size: 1rem;
-            color: var(--text-muted);
-            line-height: 1.5;
-            white-space: pre-wrap;
-        }
-
         /* Leaderboard */
         .leaderboard-section {
             padding: 1rem;
-            flex-shrink: 0;
+            flex: 1;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
 
         .leaderboard-list {
             list-style: none;
             font-size: 0.8rem;
+            overflow-y: auto;
+            flex: 1;
         }
 
         .leaderboard-list li {
@@ -696,11 +676,6 @@
                 </ul>
             </div>
 
-            <div class="sidebar-section problem-info" id="problem-info">
-                <h3>Problem Info</h3>
-                <p class="empty-state">Select a problem to view details</p>
-            </div>
-
             <div class="leaderboard-section">
                 <h3 style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 0.75rem;">Leaderboard</h3>
                 <ul class="leaderboard-list" id="leaderboard-list">
@@ -762,7 +737,6 @@
 
         // DOM elements
         const problemList = document.getElementById('problem-list');
-        const problemInfo = document.getElementById('problem-info');
         const leaderboardList = document.getElementById('leaderboard-list');
         const editorContainer = document.getElementById('editor');
         const consoleOutput = document.getElementById('console-output');
@@ -1380,14 +1354,12 @@
                 const existing = modelsByProblemId.get(problemId);
                 if (existing?.model) {
                     editor.setModel(existing.model);
-                    renderProblemInfo(existing.originalStub);
                 } else {
                     const stubText = await fetchStub(problemId);
                     if (token !== selectionToken) return;
                     const model = monaco.editor.createModel(stubText, 'cuda');
                     modelsByProblemId.set(problemId, { model, originalStub: stubText });
                     editor.setModel(model);
-                    renderProblemInfo(stubText);
                 }
             } catch (error) {
                 log('Failed to load problem: ' + error.message, 'error');
@@ -1424,45 +1396,6 @@
 
             setEditorContent(data.kernel_source);
             log(`Loaded your last submission for ${problemId} (${data.kernel_hash || 'no hash'})`, 'info');
-        }
-
-        function renderProblemInfo(stubContent) {
-            // Parse comment block from stub
-            const commentMatch = stubContent.match(/\/\*\s*([\s\S]*?)\*\//);
-            if (!commentMatch) {
-                problemInfo.innerHTML = `
-                    <h3>Problem Info</h3>
-                    <div class="problem-name">${currentProblem.name}</div>
-                `;
-                return;
-            }
-
-            const comment = commentMatch[1];
-            const lines = comment.split('\n').map(l => l.replace(/^\s*\*\s?/, '').trim());
-
-            // Extract parts
-            let name = currentProblem.name;
-            let chapter = '';
-            let description = [];
-            let inDescription = false;
-
-            for (const line of lines) {
-                if (line.startsWith('Problem:')) {
-                    name = line.replace('Problem:', '').trim();
-                } else if (line.startsWith('PMPP')) {
-                    chapter = line;
-                } else if (line && !line.startsWith('Input:') && !line.startsWith('Output:') &&
-                           !line.startsWith('Key concepts:') && !line.startsWith('Optimization')) {
-                    description.push(line);
-                }
-            }
-
-            problemInfo.innerHTML = `
-                <h3>Problem Info</h3>
-                <div class="problem-name">${name}</div>
-                ${chapter ? `<div class="problem-chapter">${chapter}</div>` : ''}
-                <div class="problem-description">${description.slice(0, 5).join('\n')}</div>
-            `;
         }
 
         function setEditorContent(content) {
