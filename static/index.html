@@ -180,7 +180,8 @@
 
         .leaderboard-list li {
             display: flex;
-            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
             padding: 0.4rem 0;
             border-bottom: 1px solid var(--border);
         }
@@ -208,6 +209,24 @@
         .leaderboard-time {
             color: var(--success);
             font-family: monospace;
+            width: 110px;
+            text-align: right;
+        }
+
+        .leaderboard-btn {
+            background: var(--bg-editor);
+            border: 1px solid var(--border);
+            color: var(--text);
+            border-radius: 6px;
+            padding: 0.25rem 0.5rem;
+            cursor: pointer;
+            font-size: 0.75rem;
+            flex-shrink: 0;
+        }
+
+        .leaderboard-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
         }
 
         /* Editor area */
@@ -499,6 +518,18 @@
             color: var(--text-muted);
             margin: 0.25rem 0 0.75rem;
         }
+
+        .code-pre {
+            background: var(--bg-editor);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0.9rem;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            white-space: pre;
+            overflow: auto;
+        }
     </style>
 </head>
 <body>
@@ -523,6 +554,22 @@
                 <ul class="profile-list" id="profile-best"></ul>
                 <div id="profile-recent-title" class="profile-section-title" style="display:none; margin-top: 1rem;">Recent Submissions</div>
                 <ul class="profile-list" id="profile-list"></ul>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="submission-modal" role="dialog" aria-modal="true" aria-label="Submission Code">
+        <div class="modal">
+            <div class="modal-header">
+                <div style="font-weight: 600;" id="submission-title">Submission</div>
+                <div style="display:flex; gap: 0.5rem; align-items: center;">
+                    <button class="modal-close" id="submission-copy" type="button">Copy</button>
+                    <button class="modal-close" id="submission-load" type="button">Load</button>
+                    <button class="modal-close" id="submission-close" type="button">Close</button>
+                </div>
+            </div>
+            <div class="modal-body">
+                <pre id="submission-code" class="code-pre"></pre>
             </div>
         </div>
     </div>
@@ -613,6 +660,14 @@
         const profileBest = document.getElementById('profile-best');
         const profileRecentTitle = document.getElementById('profile-recent-title');
         const profileList = document.getElementById('profile-list');
+        const submissionModal = document.getElementById('submission-modal');
+        const submissionClose = document.getElementById('submission-close');
+        const submissionCopy = document.getElementById('submission-copy');
+        const submissionLoad = document.getElementById('submission-load');
+        const submissionTitle = document.getElementById('submission-title');
+        const submissionCode = document.getElementById('submission-code');
+
+        let activeSubmission = null;
 
         // Initialize Monaco Editor
         require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
@@ -778,8 +833,18 @@
             profileModal.addEventListener('click', (e) => {
                 if (e.target === profileModal) closeProfile();
             });
+            submissionClose.addEventListener('click', closeSubmissionModal);
+            submissionModal.addEventListener('click', (e) => {
+                if (e.target === submissionModal) closeSubmissionModal();
+            });
+            submissionCopy.addEventListener('click', copyActiveSubmission);
+            submissionLoad.addEventListener('click', loadActiveSubmissionIntoEditor);
+            leaderboardList.addEventListener('click', handleLeaderboardClick);
             document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') closeProfile();
+                if (e.key === 'Escape') {
+                    closeProfile();
+                    closeSubmissionModal();
+                }
             });
         }
 
@@ -890,11 +955,14 @@
 
             leaderboardList.innerHTML = rankings.slice(0, 10).map((r, i) => {
                 const rankClass = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
+                const submissionId = r.best_submission_id;
+                const codeBtn = submissionId ? `<button class="leaderboard-btn" type="button" data-submission-id="${submissionId}">Code</button>` : '';
                 return `
                     <li>
                         <span class="leaderboard-rank ${rankClass}">${r.rank}.</span>
                         <span class="leaderboard-user">${escapeHtml(r.user_id)}</span>
                         <span class="leaderboard-time">${r.best_time_ms.toFixed(4)}ms</span>
+                        ${codeBtn}
                     </li>
                 `;
             }).join('');
@@ -1144,6 +1212,76 @@
 
         function closeProfile() {
             profileModal.classList.remove('open');
+        }
+
+        async function handleLeaderboardClick(e) {
+            const btn = e.target.closest('button[data-submission-id]');
+            if (!btn) return;
+            const submissionId = btn.getAttribute('data-submission-id');
+            if (!submissionId) return;
+            await openSubmissionModal(submissionId);
+        }
+
+        function closeSubmissionModal() {
+            submissionModal.classList.remove('open');
+            activeSubmission = null;
+            submissionTitle.textContent = 'Submission';
+            submissionCode.textContent = '';
+        }
+
+        async function openSubmissionModal(submissionId) {
+            submissionModal.classList.add('open');
+            submissionTitle.textContent = 'Loading…';
+            submissionCode.textContent = 'Loading…';
+            submissionCopy.disabled = true;
+            submissionLoad.disabled = true;
+
+            try {
+                const data = await fetchApi(`submission?submission_id=${encodeURIComponent(submissionId)}`);
+                if (!data?.submission_id) throw new Error('Bad submission payload');
+                activeSubmission = data;
+                submissionTitle.textContent = `${data.problem_id} · ${data.user_id} · ${Number(data.time_ms).toFixed(4)}ms`;
+                submissionCode.textContent = data.kernel_source || '(no source stored)';
+                submissionCopy.disabled = false;
+                submissionLoad.disabled = false;
+            } catch (e) {
+                activeSubmission = null;
+                submissionTitle.textContent = 'Failed to load';
+                submissionCode.textContent = `${e.message || e}`;
+            }
+        }
+
+        async function copyActiveSubmission() {
+            if (!activeSubmission || typeof activeSubmission.kernel_source !== 'string') return;
+            const text = activeSubmission.kernel_source;
+            try {
+                await navigator.clipboard.writeText(text);
+                log('Copied submission code to clipboard', 'success');
+            } catch {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                ta.remove();
+                log('Copied submission code to clipboard', 'success');
+            }
+        }
+
+        async function loadActiveSubmissionIntoEditor() {
+            if (!activeSubmission || typeof activeSubmission.kernel_source !== 'string') return;
+            const shouldConfirm = (() => {
+                if (!currentProblem) return true;
+                const model = editor?.getModel?.();
+                const entry = modelsByProblemId.get(currentProblem.id);
+                if (!model || !entry?.originalStub) return true;
+                return model.getValue() !== entry.originalStub;
+            })();
+            if (shouldConfirm && !confirm('Replace current editor contents with this submission?')) return;
+            await loadSubmissionIntoEditor(activeSubmission.submission_id);
+            closeSubmissionModal();
         }
 
         async function loadProfile(username) {

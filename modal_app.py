@@ -535,13 +535,20 @@ def leaderboard(problem_id: str = None):
         rows = conn.execute(
             """
             SELECT
-                user_id,
-                MIN(time_ms) as best_time_ms,
+                s.user_id,
+                MIN(s.time_ms) as best_time_ms,
                 COUNT(*) as attempts,
-                MAX(submitted_at) as last_submission
-            FROM submissions
-            WHERE problem_id = ?
-            GROUP BY user_id
+                MAX(s.submitted_at) as last_submission,
+                (
+                    SELECT s2.id
+                    FROM submissions s2
+                    WHERE s2.problem_id = s.problem_id AND s2.user_id = s.user_id
+                    ORDER BY s2.time_ms ASC, s2.id ASC
+                    LIMIT 1
+                ) as best_submission_id
+            FROM submissions s
+            WHERE s.problem_id = ?
+            GROUP BY s.user_id
             ORDER BY best_time_ms ASC
         """,
             (problem_id,),
@@ -557,6 +564,7 @@ def leaderboard(problem_id: str = None):
                     "best_time_ms": round(r["best_time_ms"], 4),
                     "attempts": r["attempts"],
                     "last_submission": r["last_submission"],
+                    "best_submission_id": r["best_submission_id"],
                 }
                 for i, r in enumerate(rows)
             ],
