@@ -1035,7 +1035,7 @@
                 closeAuthModal();
                 log(`Logged in as "${data.user_id}"`, 'success');
                 if (currentProblem) {
-                    await maybeLoadMyLastSubmission(currentProblem.id);
+                    await maybeLoadMyLastSubmission(currentProblem.id, { token: selectionToken });
                 }
             } catch (e) {
                 authStatus.textContent = `Failed: ${e.message || e}`;
@@ -1365,20 +1365,22 @@
                 log('Failed to load problem: ' + error.message, 'error');
             }
 
-            await maybeLoadMyLastSubmission(problemId);
+            await maybeLoadMyLastSubmission(problemId, { token });
             await leaderboardPromise;
         }
 
-        async function maybeLoadMyLastSubmission(problemId) {
+        async function maybeLoadMyLastSubmission(problemId, { token = null } = {}) {
             const auth = getAuth();
             if (!auth || !problemId) return;
 
             const entry = modelsByProblemId.get(problemId);
-            const model = editor?.getModel?.();
-            if (!entry?.originalStub || !model) return;
+            if (!entry?.originalStub) return;
 
-            const current = model.getValue();
             const data = await fetchApi(`my_last_submission?problem_id=${encodeURIComponent(problemId)}&token=${encodeURIComponent(auth.token)}`);
+
+            // Check if user navigated away while we were fetching
+            if (token !== null && token !== selectionToken) return;
+            if (currentProblem?.id !== problemId) return;
             if (!data || data.error) {
                 if (data?.error === 'unauthorized') {
                     clearAuth();
@@ -1387,9 +1389,15 @@
                 return;
             }
             if (typeof data.kernel_source !== 'string' || !data.kernel_source) return;
-            if (current === data.kernel_source) return;
 
-            const isPristine = current === entry.originalStub;
+            // Re-read current content since user may have edited while fetch was in flight
+            const currentModel = editor?.getModel?.();
+            if (!currentModel) return;
+            const currentContent = currentModel.getValue();
+
+            if (currentContent === data.kernel_source) return;
+
+            const isPristine = currentContent === entry.originalStub;
             if (!isPristine) {
                 if (!confirm('Load your last submission for this problem? This will replace the editor contents.')) return;
             }
