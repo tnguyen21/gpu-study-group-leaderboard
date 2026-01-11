@@ -19,17 +19,16 @@ for (int i = 0; i < N; i++) {
     h_ref[i] = h_data[i];
 }
 
-// Sort reference on CPU
-for (int i = 0; i < N - 1; i++) {
-    for (int j = 0; j < N - i - 1; j++) {
-        if (h_ref[j] > h_ref[j + 1]) {
-            unsigned int tmp = h_ref[j];
-            h_ref[j] = h_ref[j + 1];
-            h_ref[j + 1] = tmp;
-        }
-    }
-}
-// Note: In practice, use std::sort, but bubble sort works for reference
+// Sort reference on CPU (qsort keeps setup time reasonable at this N)
+qsort(
+    h_ref,
+    N,
+    sizeof(unsigned int),
+    [](const void *a, const void *b) -> int {
+        const unsigned int av = *(const unsigned int *)a;
+        const unsigned int bv = *(const unsigned int *)b;
+        return (av > bv) - (av < bv);
+    });
 
 cudaMalloc(&d_data, N * sizeof(unsigned int));
 cudaMemcpy(d_data, h_data, N * sizeof(unsigned int), cudaMemcpyHostToDevice);
@@ -42,16 +41,16 @@ sort<<<(N + 255) / 256, 256>>>(d_data, N);
 // === VALIDATION ===
 cudaMemcpy(h_data, d_data, N * sizeof(unsigned int), cudaMemcpyDeviceToHost);
 int errors = 0;
-// Check sorted order
-for (int i = 0; i < N - 1; i++) {
-    if (h_data[i] > h_data[i + 1]) {
+// Check exact match against reference (sorted order + correct permutation)
+for (int i = 0; i < N; i++) {
+    if (h_data[i] != h_ref[i]) {
         errors++;
         if (errors <= 5) {
-            fprintf(stderr, "Not sorted at %d: %u > %u\n", i, h_data[i], h_data[i + 1]);
+            fprintf(stderr, "Mismatch at %d: got %u, expected %u\n", i, h_data[i], h_ref[i]);
         }
     }
 }
 if (errors > 0) {
-    fprintf(stderr, "Validation failed: array not sorted (%d violations)\n", errors);
+    fprintf(stderr, "Validation failed: %d mismatches\n", errors);
     return 1;
 }
