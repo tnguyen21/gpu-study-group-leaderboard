@@ -10,6 +10,13 @@
  * Definition:
  *   - `C[row, col] = sum_{k=0..K-1} A[row, k] * B[k, col]`
  *
+ * Launch configuration:
+ *   - 2D grid, 2D block
+ *   - blockDim = (16, 16, 1)
+ *   - gridDim = (ceil(N/16), ceil(M/16), 1)
+ *   - Each thread computes one element of C
+ *   - Use blockIdx.x/threadIdx.x for column, blockIdx.y/threadIdx.y for row
+ *
  * Example:
  *   - A (2x3) = [[1,2,3],[4,5,6]]
  *   - B (3x2) = [[7,8],[9,10],[11,12]]

@@ -9,6 +9,11 @@
  * Output:
  *   - `c`: array of length `n`
  *
+ * Launch configuration:
+ *   - 1D grid, 1D block
+ *   - blockDim.x = 256
+ *   - gridDim.x = ceil(n / 256)
+ *
  * Example:
  *   - a = [1, 2, 3], b = [10, 20, 30]  ->  c = [11, 22, 33]
  */

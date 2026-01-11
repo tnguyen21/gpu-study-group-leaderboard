@@ -7,6 +7,13 @@
  *
  * Output:
  *   - `hist`: array of length 256, where `hist[v] = count(data[i] == v)`
+ *   - `hist` is pre-initialized to all zeros
+ *
+ * Launch configuration:
+ *   - 1D grid, 1D block
+ *   - blockDim.x = 1024
+ *   - gridDim.x = ceil(n / 1024)
+ *   - Hint: Use atomicAdd to update histogram bins
  *
  * Example:
  *   - data = [0, 1, 1, 255] -> hist[0]=1, hist[1]=2, hist[255]=1

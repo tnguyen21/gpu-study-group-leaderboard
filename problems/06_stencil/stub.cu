@@ -14,6 +14,13 @@
  *
  * Boundary points (any index is 0 or N-1):
  *   - out[...] = 0
+ *
+ * Launch configuration:
+ *   - 3D grid, 3D block
+ *   - blockDim = (8, 8, 8)
+ *   - gridDim = (ceil(N/8), ceil(N/8), ceil(N/8))
+ *   - Each thread computes one grid point
+ *   - threadIdx.x/blockIdx.x -> x, threadIdx.y/blockIdx.y -> y, threadIdx.z/blockIdx.z -> z
  */
 
 __global__ void stencil(float *in, float *out, int N,
