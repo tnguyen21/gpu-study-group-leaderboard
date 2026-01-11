@@ -55,6 +55,8 @@ MAX_USER_ID_LENGTH = 64
 MAX_COMPILE_OUTPUT_BYTES = 200_000
 MAX_RUN_OUTPUT_BYTES = 100_000
 
+MAX_PROFILE_RESULTS = 200
+
 
 # --- Security: Kernel Source Validation ---
 
@@ -161,6 +163,7 @@ def load_problems(problems_dir: str) -> dict:
 # In Modal, this will be re-loaded from /app/problems
 PROBLEMS = load_problems(str(LOCAL_PROBLEMS_DIR))
 _STUBS_BY_ID: dict[str, str] | None = None
+_DB_SCHEMA_READY = False
 
 
 def get_problems():
@@ -187,6 +190,43 @@ def get_stubs_by_id() -> dict[str, str]:
             stubs[problem_id] = stub_path.read_text()
     _STUBS_BY_ID = stubs
     return stubs
+
+
+def ensure_db_schema(conn) -> None:
+    """Create/migrate SQLite schema. Safe to call multiple times."""
+    global _DB_SCHEMA_READY
+    if _DB_SCHEMA_READY:
+        return
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            problem_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            time_ms REAL NOT NULL,
+            kernel_hash TEXT,
+            kernel_source TEXT,
+            submitted_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_problem_user ON submissions(problem_id, user_id);
+        CREATE INDEX IF NOT EXISTS idx_problem_time ON submissions(problem_id, time_ms);
+        CREATE INDEX IF NOT EXISTS idx_user_submitted_at ON submissions(user_id, submitted_at);
+
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            created_at TEXT NOT NULL
+        );
+    """)
+
+    # Migration path for existing volumes created before kernel_source existed.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(submissions)").fetchall()}
+    if "kernel_source" not in cols:
+        conn.execute("ALTER TABLE submissions ADD COLUMN kernel_source TEXT")
+
+    conn.commit()
+    _DB_SCHEMA_READY = True
 
 
 def build_harness_tu(problem_id: str) -> str:
@@ -327,32 +367,13 @@ def init_db():
     os.makedirs("/data", exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            problem_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            time_ms REAL NOT NULL,
-            kernel_hash TEXT,
-            submitted_at TEXT NOT NULL
-        );
-        
-        CREATE INDEX IF NOT EXISTS idx_problem_user ON submissions(problem_id, user_id);
-        CREATE INDEX IF NOT EXISTS idx_problem_time ON submissions(problem_id, time_ms);
-        
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            display_name TEXT,
-            created_at TEXT NOT NULL
-        );
-    """)
-    conn.commit()
+    ensure_db_schema(conn)
     conn.close()
     vol.commit()
     print("Database initialized!")
 
 @app.function(image=web_image, volumes={"/data": vol}, timeout=30)
-def record_submission(problem_id: str, user_id: str, time_ms: float, kernel_hash: str) -> None:
+def record_submission(problem_id: str, user_id: str, time_ms: float, kernel_hash: str, kernel_source: str) -> None:
     """Persist a benchmark result to SQLite (separate from untrusted kernel execution)."""
     import sqlite3
     from datetime import datetime
@@ -361,31 +382,13 @@ def record_submission(problem_id: str, user_id: str, time_ms: float, kernel_hash
     vol.reload()
 
     conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            problem_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            time_ms REAL NOT NULL,
-            kernel_hash TEXT,
-            submitted_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_problem_user ON submissions(problem_id, user_id);
-        CREATE INDEX IF NOT EXISTS idx_problem_time ON submissions(problem_id, time_ms);
-
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            display_name TEXT,
-            created_at TEXT NOT NULL
-        );
-    """)
+    ensure_db_schema(conn)
     conn.execute(
         """
-        INSERT INTO submissions (problem_id, user_id, time_ms, kernel_hash, submitted_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO submissions (problem_id, user_id, time_ms, kernel_hash, kernel_source, submitted_at)
+        VALUES (?, ?, ?, ?, ?, ?)
     """,
-        (problem_id, user_id, time_ms, kernel_hash, datetime.utcnow().isoformat()),
+        (problem_id, user_id, time_ms, kernel_hash, kernel_source, datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -525,6 +528,7 @@ def leaderboard(problem_id: str = None):
     problems = get_problems()
     vol.reload()  # Get latest data from other containers
     conn = sqlite3.connect(DB_PATH)
+    ensure_db_schema(conn)
     conn.row_factory = sqlite3.Row
 
     if problem_id:
@@ -639,6 +643,143 @@ def stubs():
         headers={"Cache-Control": "public, max-age=604800"},
     )
 
+@app.function(image=web_image, volumes={"/data": vol})
+@modal.fastapi_endpoint(method="GET")
+def profile(user_id: str, limit: int = 50):
+    """Get recent submissions for a user across all problems."""
+    import sqlite3
+
+    from fastapi.responses import JSONResponse
+
+    if not isinstance(user_id, str) or not user_id:
+        return JSONResponse(content={"error": "missing_user_id"}, status_code=400)
+    if len(user_id) > MAX_USER_ID_LENGTH:
+        return JSONResponse(content={"error": "invalid_user_id"}, status_code=400)
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(MAX_PROFILE_RESULTS, limit))
+
+    problems = get_problems()
+    vol.reload()
+    conn = sqlite3.connect(DB_PATH)
+    ensure_db_schema(conn)
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            problem_id,
+            time_ms,
+            kernel_hash,
+            submitted_at
+        FROM submissions
+        WHERE user_id = ?
+        ORDER BY submitted_at DESC, id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    ).fetchall()
+
+    best_rows = conn.execute(
+        """
+        SELECT
+            problem_id,
+            MIN(time_ms) AS best_time_ms
+        FROM submissions
+        WHERE user_id = ?
+        GROUP BY problem_id
+        """,
+        (user_id,),
+    ).fetchall()
+
+    conn.close()
+
+    return JSONResponse(
+        content={
+            "user_id": user_id,
+            "recent": [
+                {
+                    "submission_id": r["id"],
+                    "problem_id": r["problem_id"],
+                    "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
+                    "time_ms": round(r["time_ms"], 4),
+                    "kernel_hash": r["kernel_hash"],
+                    "submitted_at": r["submitted_at"],
+                }
+                for r in rows
+            ],
+            "best_by_problem": [
+                {
+                    "problem_id": r["problem_id"],
+                    "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
+                    "best_time_ms": round(r["best_time_ms"], 4) if r["best_time_ms"] is not None else None,
+                }
+                for r in best_rows
+            ],
+        },
+        headers={"Cache-Control": "private, max-age=5"},
+    )
+
+
+@app.function(image=web_image, volumes={"/data": vol})
+@modal.fastapi_endpoint(method="GET")
+def submission(submission_id: int):
+    """Get stored kernel_source for a single submission."""
+    import sqlite3
+
+    from fastapi.responses import JSONResponse
+
+    try:
+        submission_id = int(submission_id)
+    except (TypeError, ValueError):
+        return JSONResponse(content={"error": "invalid_submission_id"}, status_code=400)
+    if submission_id <= 0:
+        return JSONResponse(content={"error": "invalid_submission_id"}, status_code=400)
+
+    problems = get_problems()
+    vol.reload()
+    conn = sqlite3.connect(DB_PATH)
+    ensure_db_schema(conn)
+    conn.row_factory = sqlite3.Row
+
+    row = conn.execute(
+        """
+        SELECT
+            id,
+            problem_id,
+            user_id,
+            time_ms,
+            kernel_hash,
+            kernel_source,
+            submitted_at
+        FROM submissions
+        WHERE id = ?
+        """,
+        (submission_id,),
+    ).fetchone()
+    conn.close()
+
+    if row is None:
+        return JSONResponse(content={"error": "not_found"}, status_code=404)
+
+    return JSONResponse(
+        content={
+            "submission_id": row["id"],
+            "problem_id": row["problem_id"],
+            "problem_name": problems.get(row["problem_id"], {}).get("name", row["problem_id"]),
+            "user_id": row["user_id"],
+            "time_ms": round(row["time_ms"], 4),
+            "kernel_hash": row["kernel_hash"],
+            "kernel_source": row["kernel_source"] or "",
+            "submitted_at": row["submitted_at"],
+        },
+        headers={"Cache-Control": "private, max-age=60"},
+    )
+
 
 @app.function(image=web_image)
 @modal.fastapi_endpoint(method="GET")
@@ -693,7 +834,7 @@ def submit(request: dict):
     if not result.get("success"):
         return result
 
-    record_submission.remote(problem_id, user_id, result["time_ms"], result["kernel_hash"])
+    record_submission.remote(problem_id, user_id, result["time_ms"], result["kernel_hash"], kernel_source)
     return {
         **result,
         "user_id": user_id,

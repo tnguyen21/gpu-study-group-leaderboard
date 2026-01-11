@@ -57,6 +57,21 @@
             gap: 1rem;
         }
 
+        .header-link {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+            border-radius: 6px;
+            padding: 0.5rem 0.75rem;
+            cursor: pointer;
+            font-size: 0.875rem;
+        }
+
+        .header-link:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
         .username-input {
             background: var(--bg-editor);
             border: 1px solid var(--border);
@@ -377,16 +392,140 @@
             font-size: 0.875rem;
             font-style: italic;
         }
+
+        /* Modal */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.6);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+
+        .modal-overlay.open {
+            display: flex;
+        }
+
+        .modal {
+            width: min(900px, 92vw);
+            max-height: 80vh;
+            background: var(--bg-main);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .modal-body {
+            padding: 1rem;
+            overflow: auto;
+        }
+
+        .modal-close {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+            border-radius: 6px;
+            padding: 0.4rem 0.75rem;
+            cursor: pointer;
+        }
+
+        .profile-list {
+            list-style: none;
+        }
+
+        .profile-list li {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+            padding: 0.6rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .profile-problem {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .profile-meta {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            width: 220px;
+            text-align: right;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .profile-time {
+            font-family: monospace;
+            color: var(--success);
+            width: 110px;
+            text-align: right;
+        }
+
+        .profile-btn {
+            background: var(--bg-editor);
+            border: 1px solid var(--border);
+            color: var(--text);
+            border-radius: 6px;
+            padding: 0.35rem 0.6rem;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+
+        .profile-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .profile-section-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin: 0.25rem 0 0.75rem;
+        }
     </style>
 </head>
 <body>
     <header class="header">
         <h1>GPU Kernel Leaderboard</h1>
         <div class="header-right">
+            <button class="header-link" id="profile-btn" type="button">Profile</button>
             <label style="font-size: 0.875rem; color: var(--text-muted);">Username:</label>
             <input type="text" id="username" class="username-input" placeholder="anonymous" />
         </div>
     </header>
+
+    <div class="modal-overlay" id="profile-modal" role="dialog" aria-modal="true" aria-label="Profile">
+        <div class="modal">
+            <div class="modal-header">
+                <div style="font-weight: 600;">Profile</div>
+                <button class="modal-close" id="profile-close" type="button">Close</button>
+            </div>
+            <div class="modal-body">
+                <div id="profile-status" class="empty-state">Loading…</div>
+                <div id="profile-best-title" class="profile-section-title" style="display:none;">Best By Problem</div>
+                <ul class="profile-list" id="profile-best"></ul>
+                <div id="profile-recent-title" class="profile-section-title" style="display:none; margin-top: 1rem;">Recent Submissions</div>
+                <ul class="profile-list" id="profile-list"></ul>
+            </div>
+        </div>
+    </div>
 
     <div class="main-container">
         <aside class="sidebar">
@@ -466,6 +605,14 @@
         const usernameInput = document.getElementById('username');
         const filenameTab = document.getElementById('filename-tab');
         const clearConsoleBtn = document.getElementById('clear-console');
+        const profileBtn = document.getElementById('profile-btn');
+        const profileModal = document.getElementById('profile-modal');
+        const profileClose = document.getElementById('profile-close');
+        const profileStatus = document.getElementById('profile-status');
+        const profileBestTitle = document.getElementById('profile-best-title');
+        const profileBest = document.getElementById('profile-best');
+        const profileRecentTitle = document.getElementById('profile-recent-title');
+        const profileList = document.getElementById('profile-list');
 
         // Initialize Monaco Editor
         require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
@@ -505,6 +652,7 @@
                 escapes: /\\(?:[abfnrtv\\"']|x[0-9A-Fa-f]{1,4}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/,
                 tokenizer: {
                     root: [
+                        [/#\s*(define|include|if|ifdef|ifndef|elif|else|endif|pragma|error|warning|undef|line)\b/, 'keyword.directive'],
                         [/[a-z_$][\w$]*/, {
                             cases: {
                                 '@typeKeywords': 'keyword.type',
@@ -552,11 +700,21 @@
                 }
             });
 
+            monaco.editor.defineTheme('kernel-dark', {
+                base: 'vs-dark',
+                inherit: true,
+                rules: [
+                    // Avoid fallback fonts when a font variant isn't available (e.g. italic/bold directives).
+                    { token: 'keyword.directive', fontStyle: '' },
+                ],
+                colors: {}
+            });
+
             // Create editor
             editor = monaco.editor.create(editorContainer, {
                 value: '// Select a problem from the sidebar to get started\n',
                 language: 'cuda',
-                theme: 'vs-dark',
+                theme: 'kernel-dark',
                 fontSize: 14,
                 fontFamily: "'Fira Code', 'Cascadia Code', 'JetBrains Mono', Menlo, Monaco, monospace",
                 fontLigatures: true,
@@ -592,10 +750,14 @@
                 usernameInput.value = savedUsername;
             }
 
-            // Save username on change
-            usernameInput.addEventListener('change', () => {
-                localStorage.setItem('leaderboard_username', usernameInput.value);
-            });
+            const persistUsername = () => {
+                localStorage.setItem('leaderboard_username', usernameInput.value.trim());
+            };
+
+            // Save username as you type (so submit doesn't rely on blur/change).
+            usernameInput.addEventListener('input', persistUsername);
+            usernameInput.addEventListener('change', persistUsername);
+            usernameInput.addEventListener('blur', persistUsername);
 
             // Compute Modal base host once (if applicable) so we can build URLs cheaply.
             const host = window.location.host;
@@ -611,6 +773,14 @@
             submitBtn.addEventListener('click', handleSubmit);
             resetBtn.addEventListener('click', handleReset);
             clearConsoleBtn.addEventListener('click', clearConsole);
+            profileBtn.addEventListener('click', openProfile);
+            profileClose.addEventListener('click', closeProfile);
+            profileModal.addEventListener('click', (e) => {
+                if (e.target === profileModal) closeProfile();
+            });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeProfile();
+            });
         }
 
         // API helpers
@@ -909,6 +1079,7 @@
             if (!currentProblem || isSubmitting) return;
 
             const username = usernameInput.value.trim() || 'anonymous';
+            localStorage.setItem('leaderboard_username', username);
             const kernelSource = getEditorContent();
 
             if (!kernelSource.trim()) {
@@ -961,6 +1132,86 @@
                 isSubmitting = false;
                 submitBtn.disabled = false;
                 submitBtn.textContent = 'Submit';
+            }
+        }
+
+        function openProfile() {
+            const username = usernameInput.value.trim() || 'anonymous';
+            localStorage.setItem('leaderboard_username', username);
+            profileModal.classList.add('open');
+            loadProfile(username);
+        }
+
+        function closeProfile() {
+            profileModal.classList.remove('open');
+        }
+
+        async function loadProfile(username) {
+            profileStatus.textContent = 'Loading…';
+            profileStatus.style.display = 'block';
+            profileBestTitle.style.display = 'none';
+            profileRecentTitle.style.display = 'none';
+            profileBest.innerHTML = '';
+            profileList.innerHTML = '';
+
+            try {
+                const data = await fetchApi(`profile?user_id=${encodeURIComponent(username)}&limit=100`);
+                const recent = data?.recent || [];
+                const best = data?.best_by_problem || [];
+
+                if (best.length === 0 && recent.length === 0) {
+                    profileStatus.textContent = 'No submissions yet.';
+                    return;
+                }
+
+                profileStatus.style.display = 'none';
+
+                if (best.length > 0) {
+                    profileBestTitle.style.display = 'block';
+                    profileBest.innerHTML = best.map((r) => `
+                        <li>
+                            <div class="profile-problem">${escapeHtml(r.problem_name)} <span style="color: var(--text-muted);">(${escapeHtml(r.problem_id)})</span></div>
+                            <div class="profile-time">${Number(r.best_time_ms).toFixed(4)}ms</div>
+                            <div class="profile-meta"></div>
+                        </li>
+                    `).join('');
+                }
+
+                if (recent.length > 0) {
+                    profileRecentTitle.style.display = 'block';
+                }
+                profileList.innerHTML = recent.map((r) => `
+                    <li>
+                        <div class="profile-problem">${escapeHtml(r.problem_name)} <span style="color: var(--text-muted);">(${escapeHtml(r.problem_id)})</span></div>
+                        <div class="profile-time">${Number(r.time_ms).toFixed(4)}ms</div>
+                        <div class="profile-meta">${escapeHtml(r.submitted_at)} · ${escapeHtml(r.kernel_hash || '')}</div>
+                        <button class="profile-btn" type="button" data-submission-id="${r.submission_id}">Load</button>
+                    </li>
+                `).join('');
+
+                profileList.querySelectorAll('button[data-submission-id]').forEach(btn => {
+                    btn.addEventListener('click', async () => {
+                        const id = btn.getAttribute('data-submission-id');
+                        if (!id) return;
+                        await loadSubmissionIntoEditor(id);
+                        closeProfile();
+                    });
+                });
+            } catch (e) {
+                profileStatus.textContent = `Failed to load profile: ${e.message || e}`;
+            }
+        }
+
+        async function loadSubmissionIntoEditor(submissionId) {
+            try {
+                const data = await fetchApi(`submission?submission_id=${encodeURIComponent(submissionId)}`);
+                if (!data?.problem_id) throw new Error('Bad submission payload');
+                if (typeof data?.kernel_source !== 'string') throw new Error('Missing kernel source');
+                await selectProblem(data.problem_id);
+                setEditorContent(data.kernel_source);
+                log(`Loaded submission ${submissionId} (${data.kernel_hash || 'no hash'})`, 'info');
+            } catch (e) {
+                log(`Failed to load submission: ${e.message || e}`, 'error');
             }
         }
 
