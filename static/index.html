@@ -128,6 +128,17 @@
             margin-top: 0.5rem;
         }
 
+        .auth-note {
+            margin: 0 0 0.75rem 0;
+            padding: 0.6rem 0.75rem;
+            border: 1px dashed var(--border);
+            border-radius: 10px;
+            background: var(--bg-editor);
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            line-height: 1.3;
+        }
+
         /* Main layout */
         .main-container {
             display: flex;
@@ -222,20 +233,20 @@
         }
 
         .problem-name {
-            font-size: 1rem;
+            font-size: 1.2rem;
             font-weight: 600;
             margin-bottom: 0.5rem;
             color: var(--text);
         }
 
         .problem-chapter {
-            font-size: 0.8rem;
+            font-size: 1rem;
             color: var(--accent);
             margin-bottom: 0.75rem;
         }
 
         .problem-description {
-            font-size: 0.8rem;
+            font-size: 1rem;
             color: var(--text-muted);
             line-height: 1.5;
             white-space: pre-wrap;
@@ -617,13 +628,16 @@
         </div>
     </header>
 
-    <div class="modal-overlay" id="auth-modal" role="dialog" aria-modal="true" aria-label="Login">
+    <div class="modal-overlay" id="auth-modal" role="dialog" aria-modal="true" aria-label="Login or sign up">
         <div class="modal" style="width: min(520px, 92vw);">
             <div class="modal-header">
-                <div style="font-weight: 600;" id="auth-title">Login</div>
+                <div style="font-weight: 600;" id="auth-title">Login / Sign up</div>
                 <button class="modal-close" id="auth-close" type="button">Close</button>
             </div>
             <div class="modal-body">
+                <div class="auth-note">
+                    Hacky account flow. No email verification and no password reset. Don't reuse important passwords!!
+                </div>
                 <div id="auth-status" class="empty-state" style="display:none;"></div>
                 <div class="auth-modal-row">
                     <label for="auth-username" style="font-size: 0.8rem; color: var(--text-muted);">Username</label>
@@ -826,7 +840,7 @@
                 escapes: /\\(?:[abfnrtv\\"']|x[0-9A-Fa-f]{1,4}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/,
                 tokenizer: {
                     root: [
-                        [/#\s*(define|include|if|ifdef|ifndef|elif|else|endif|pragma|error|warning|undef|line)\b/, 'keyword.directive'],
+                        [/#\s*(include|if|ifdef|ifndef|elif|else|endif|pragma|error|warning|undef|line)\b/, 'keyword.directive'],
                         [/[a-z_$][\w$]*/, {
                             cases: {
                                 '@typeKeywords': 'keyword.type',
@@ -995,7 +1009,7 @@
         }
 
         function openAuthModal() {
-            authTitle.textContent = 'Login';
+            authTitle.textContent = 'Login / Sign up';
             authStatus.style.display = 'none';
             authStatus.textContent = '';
             authUsername.value = localStorage.getItem(AUTH_USER_ID_KEY) || '';

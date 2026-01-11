@@ -875,12 +875,26 @@ def web():
         conn = sqlite3.connect(DB_PATH, timeout=30)
         ensure_db_schema(conn)
 
-        existing = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        existing = conn.execute("SELECT password_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
         if existing is not None:
+            existing_password_hash = existing[0]
+            if existing_password_hash:
+                conn.close()
+                return JSONResponse(
+                    content={
+                        "success": False,
+                        "error": "user_exists",
+                        "message": "Username already taken. Try logging in instead, or choose a different username.",
+                    },
+                    status_code=409,
+                )
+            conn.execute("UPDATE users SET password_hash = ? WHERE user_id = ?", (password_hash, user_id))
+            conn.commit()
             conn.close()
+            vol.commit()
             return JSONResponse(
-                content={"success": False, "error": "user_exists", "message": "Username already taken"},
-                status_code=409,
+                content={"success": True, "user_id": user_id, "upgraded": True},
+                headers={"Cache-Control": "no-store"},
             )
 
         conn.execute(
@@ -910,10 +924,30 @@ def web():
         ensure_db_schema(conn)
 
         row = conn.execute("SELECT password_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        if row is None or not row[0] or not verify_password(password, row[0]):
+        if row is None:
             conn.close()
             return JSONResponse(
-                content={"success": False, "error": "invalid_credentials", "message": "Invalid username or password"},
+                content={
+                    "success": False,
+                    "error": "user_not_found",
+                    "message": "No account found for that username. Click Sign up to create it first.",
+                },
+                status_code=404,
+            )
+        if not row[0]:
+            conn.close()
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "error": "password_not_set",
+                    "message": "This username exists but doesn't have a password yet. Click Sign up to set one.",
+                },
+                status_code=401,
+            )
+        if not verify_password(password, row[0]):
+            conn.close()
+            return JSONResponse(
+                content={"success": False, "error": "incorrect_password", "message": "Incorrect password for this username."},
                 status_code=401,
             )
 
