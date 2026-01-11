@@ -32,6 +32,13 @@ cuda_image = (
     .add_local_dir(str(LOCAL_STATIC_DIR), "/app/static")  # Include static files for web UI
 )
 
+web_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("fastapi[standard]")
+    .add_local_dir(str(LOCAL_PROBLEMS_DIR), "/app/problems")
+    .add_local_dir(str(LOCAL_STATIC_DIR), "/app/static")
+)
+
 app = modal.App("kernel-leaderboard")
 vol = modal.Volume.from_name("leaderboard-data", create_if_missing=True)
 
@@ -153,6 +160,7 @@ def load_problems(problems_dir: str) -> dict:
 # Load problems at module level (for local testing)
 # In Modal, this will be re-loaded from /app/problems
 PROBLEMS = load_problems(str(LOCAL_PROBLEMS_DIR))
+_STUBS_BY_ID: dict[str, str] | None = None
 
 
 def get_problems():
@@ -162,6 +170,23 @@ def get_problems():
     if Path(PROBLEMS_DIR).exists() and not PROBLEMS:
         PROBLEMS = load_problems(PROBLEMS_DIR)
     return PROBLEMS
+
+
+def get_stubs_by_id() -> dict[str, str]:
+    """Get a {problem_id: stub_text} mapping, lazily loaded per container."""
+    global _STUBS_BY_ID
+    if _STUBS_BY_ID is not None:
+        return _STUBS_BY_ID
+
+    problems = get_problems()
+    stubs: dict[str, str] = {}
+    base = Path(PROBLEMS_DIR)
+    for problem_id in problems.keys():
+        stub_path = base / problem_id / "stub.cu"
+        if stub_path.exists():
+            stubs[problem_id] = stub_path.read_text()
+    _STUBS_BY_ID = stubs
+    return stubs
 
 
 def build_harness_tu(problem_id: str) -> str:
@@ -294,7 +319,7 @@ def parse_time_ms(stdout: str) -> float:
 # --- Modal Functions ---
 
 
-@app.function(image=cuda_image, volumes={"/data": vol})
+@app.function(image=web_image, volumes={"/data": vol})
 def init_db():
     """Initialize the SQLite database."""
     import sqlite3
@@ -326,7 +351,7 @@ def init_db():
     vol.commit()
     print("Database initialized!")
 
-@app.function(image=cuda_image, volumes={"/data": vol}, timeout=30)
+@app.function(image=web_image, volumes={"/data": vol}, timeout=30)
 def record_submission(problem_id: str, user_id: str, time_ms: float, kernel_hash: str) -> None:
     """Persist a benchmark result to SQLite (separate from untrusted kernel execution)."""
     import sqlite3
@@ -489,7 +514,7 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
         }
 
 
-@app.function(image=cuda_image, volumes={"/data": vol})
+@app.function(image=web_image, volumes={"/data": vol})
 @modal.fastapi_endpoint(method="GET")
 def leaderboard(problem_id: str = None):
     """Get leaderboard data as JSON."""
@@ -561,7 +586,7 @@ def leaderboard(problem_id: str = None):
     return JSONResponse(content=result, headers={"Cache-Control": "public, max-age=10"})
 
 
-@app.function(image=cuda_image, volumes={"/data": vol})
+@app.function(image=web_image)
 @modal.fastapi_endpoint(method="GET")
 def problems():
     """List available problems."""
@@ -582,7 +607,7 @@ def problems():
     return JSONResponse(content=data, headers={"Cache-Control": "public, max-age=86400"})
 
 
-@app.function(image=cuda_image)
+@app.function(image=web_image)
 @modal.fastapi_endpoint(method="GET")
 def stub(problem_id: str):
     """Get the stub.cu content for a problem (for web editor)."""
@@ -594,17 +619,28 @@ def stub(problem_id: str):
             content={"error": f"Problem '{problem_id}' not found"}, status_code=404
         )
 
-    stub_path = Path(PROBLEMS_DIR) / problem_id / "stub.cu"
-    if stub_path.exists():
+    stubs = get_stubs_by_id()
+    if problem_id in stubs:
         # Cache for 7 days - stubs never change between deployments
         return JSONResponse(
-            content={"stub": stub_path.read_text()},
+            content={"stub": stubs[problem_id]},
             headers={"Cache-Control": "public, max-age=604800"},
         )
     return JSONResponse(content={"error": "Stub file not found"}, status_code=404)
 
+@app.function(image=web_image)
+@modal.fastapi_endpoint(method="GET")
+def stubs():
+    """Get all stub.cu contents for all problems in one request."""
+    from fastapi.responses import JSONResponse
 
-@app.function(image=cuda_image)
+    return JSONResponse(
+        content={"stubs": get_stubs_by_id()},
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
+
+
+@app.function(image=web_image)
 @modal.fastapi_endpoint(method="GET")
 def index():
     """Serve the main web UI."""
@@ -612,12 +648,12 @@ def index():
 
     html_path = Path("/app/static/index.html")
     if html_path.exists():
-        return HTMLResponse(content=html_path.read_text())
+        return HTMLResponse(content=html_path.read_text(), headers={"Cache-Control": "public, max-age=300"})
     return HTMLResponse(content="<h1>Error: index.html not found</h1>", status_code=404)
 
 
 @app.function(
-    image=cuda_image,
+    image=web_image,
     timeout=120,
 )
 @modal.fastapi_endpoint(method="POST")

@@ -441,9 +441,19 @@
         // State
         let problems = [];
         let currentProblem = null;
-        let originalStub = '';
         let editor = null;
         let isSubmitting = false;
+        let selectionToken = 0;
+
+        const stubCache = new Map(); // problemId -> stubText
+        const stubFetches = new Map(); // problemId -> Promise<string>
+        const leaderboardCache = new Map(); // problemId -> { data, fetchedAtMs }
+        const leaderboardFetches = new Map(); // problemId -> Promise<any>
+        const modelsByProblemId = new Map(); // problemId -> { model, originalStub }
+
+        const LEADERBOARD_TTL_MS = 10_000;
+        let modalBaseHost = null; // "workspace--kernel-leaderboard" (no -endpoint suffix)
+        let problemListClickBound = false;
 
         // DOM elements
         const problemList = document.getElementById('problem-list');
@@ -566,6 +576,14 @@
             init();
         });
 
+        function scheduleIdle(fn) {
+            if (window.requestIdleCallback) {
+                window.requestIdleCallback(fn, { timeout: 1000 });
+            } else {
+                setTimeout(fn, 0);
+            }
+        }
+
         // Initialize app
         async function init() {
             // Load username from localStorage
@@ -578,6 +596,13 @@
             usernameInput.addEventListener('change', () => {
                 localStorage.setItem('leaderboard_username', usernameInput.value);
             });
+
+            // Compute Modal base host once (if applicable) so we can build URLs cheaply.
+            const host = window.location.host;
+            if (host.includes('modal.run')) {
+                const match = host.match(/^(.+--kernel-leaderboard)-\w+\.modal\.run$/);
+                modalBaseHost = match ? match[1] : null;
+            }
 
             // Load problems
             await loadProblems();
@@ -594,14 +619,8 @@
             const [endpoint, queryString] = endpointWithParams.split('?');
             const query = queryString ? `?${queryString}` : '';
 
-            const host = window.location.host;
-            if (host.includes('modal.run')) {
-                // Modal format: "workspace--kernel-leaderboard-index.modal.run"
-                // We need: "workspace--kernel-leaderboard-{endpoint}.modal.run?query"
-                const match = host.match(/^(.+--kernel-leaderboard)-\w+\.modal\.run$/);
-                if (match) {
-                    return `https://${match[1]}-${endpoint}.modal.run${query}`;
-                }
+            if (modalBaseHost) {
+                return `https://${modalBaseHost}-${endpoint}.modal.run${query}`;
             }
             // Local development - assume same origin
             return `/${endpoint}${query}`;
@@ -614,6 +633,136 @@
             return response.json();
         }
 
+        async function fetchStub(problemId) {
+            if (stubCache.has(problemId)) return stubCache.get(problemId);
+            if (stubFetches.has(problemId)) return stubFetches.get(problemId);
+
+            const promise = (async () => {
+                const data = await fetchApi(`stub?problem_id=${problemId}`);
+                const stubText = data?.stub;
+                if (!stubText) {
+                    throw new Error(data?.error || 'Failed to load stub');
+                }
+                stubCache.set(problemId, stubText);
+                return stubText;
+            })();
+
+            stubFetches.set(problemId, promise);
+            try {
+                return await promise;
+            } finally {
+                stubFetches.delete(problemId);
+            }
+        }
+
+        async function preloadStubs() {
+            try {
+                const data = await fetchApi('stubs');
+                const allStubs = data?.stubs || {};
+                for (const [problemId, stubText] of Object.entries(allStubs)) {
+                    if (typeof stubText === 'string' && stubText) {
+                        stubCache.set(problemId, stubText);
+                    }
+                }
+                scheduleIdle(warmProblemModels);
+            } catch {
+                // Best-effort: individual stub loads will still work.
+            }
+        }
+
+        function warmProblemModels() {
+            const queue = problems.map(p => p.id).filter(pid => !modelsByProblemId.has(pid) && stubCache.has(pid));
+            const step = () => {
+                const nextId = queue.shift();
+                if (!nextId) return;
+                const stubText = stubCache.get(nextId);
+                if (typeof stubText === 'string') {
+                    const model = monaco.editor.createModel(stubText, 'cuda');
+                    modelsByProblemId.set(nextId, { model, originalStub: stubText });
+                }
+                if (queue.length > 0) scheduleIdle(step);
+            };
+            scheduleIdle(step);
+        }
+
+        async function fetchLeaderboardData(problemId, { force = false } = {}) {
+            const cached = leaderboardCache.get(problemId);
+            const now = Date.now();
+            if (!force && cached && (now - cached.fetchedAtMs) < LEADERBOARD_TTL_MS) {
+                return cached.data;
+            }
+            if (!force && leaderboardFetches.has(problemId)) {
+                return leaderboardFetches.get(problemId);
+            }
+
+            const promise = (async () => {
+                const data = await fetchApi(`leaderboard?problem_id=${problemId}`);
+                leaderboardCache.set(problemId, { data, fetchedAtMs: Date.now() });
+                return data;
+            })();
+
+            leaderboardFetches.set(problemId, promise);
+            try {
+                return await promise;
+            } finally {
+                leaderboardFetches.delete(problemId);
+            }
+        }
+
+        function renderLeaderboard(problemId, data) {
+            if (!currentProblem || currentProblem.id !== problemId) return;
+            const rankings = data?.rankings || [];
+
+            if (rankings.length === 0) {
+                leaderboardList.innerHTML = '<li class="empty-state">No submissions yet</li>';
+                return;
+            }
+
+            leaderboardList.innerHTML = rankings.slice(0, 10).map((r, i) => {
+                const rankClass = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
+                return `
+                    <li>
+                        <span class="leaderboard-rank ${rankClass}">${r.rank}.</span>
+                        <span class="leaderboard-user">${escapeHtml(r.user_id)}</span>
+                        <span class="leaderboard-time">${r.best_time_ms.toFixed(4)}ms</span>
+                    </li>
+                `;
+            }).join('');
+        }
+
+        async function ensureLeaderboard(problemId, { render = true, force = false, token = null } = {}) {
+            if (render && currentProblem && currentProblem.id === problemId) {
+                leaderboardList.innerHTML = '<li class="empty-state">Loading…</li>';
+            }
+            try {
+                const data = await fetchLeaderboardData(problemId, { force });
+                if (token !== null && token !== selectionToken) return;
+                if (render) renderLeaderboard(problemId, data);
+            } catch {
+                if (token !== null && token !== selectionToken) return;
+                if (render && currentProblem && currentProblem.id === problemId) {
+                    leaderboardList.innerHTML = '<li class="empty-state">Failed to load</li>';
+                }
+            }
+        }
+
+        function preloadLeaderboards() {
+            const ids = problems.map(p => p.id);
+            let i = 0;
+            const concurrency = 2;
+
+            const pump = async () => {
+                while (i < ids.length) {
+                    const problemId = ids[i++];
+                    await ensureLeaderboard(problemId, { render: false });
+                }
+            };
+
+            for (let c = 0; c < concurrency; c++) {
+                scheduleIdle(() => pump());
+            }
+        }
+
         async function loadProblems() {
             try {
                 const data = await fetchApi('problems');
@@ -624,6 +773,10 @@
                 if (problems.length > 0) {
                     selectProblem(problems[0].id);
                 }
+
+                // Best-effort preloading to make switching snappy.
+                scheduleIdle(preloadStubs);
+                scheduleIdle(preloadLeaderboards);
             } catch (error) {
                 log('Failed to load problems: ' + error.message, 'error');
                 problemList.innerHTML = '<li class="empty-state">Failed to load problems</li>';
@@ -637,40 +790,58 @@
                 </li>
             `).join('');
 
-            // Add click handlers
-            problemList.querySelectorAll('li').forEach(li => {
-                li.addEventListener('click', () => {
+            if (!problemListClickBound) {
+                problemList.addEventListener('click', (e) => {
+                    const li = e.target.closest('li[data-id]');
+                    if (!li) return;
                     selectProblem(li.dataset.id);
                 });
-            });
+                problemListClickBound = true;
+            }
+        }
+
+        function updateActiveProblemInList(problemId) {
+            const prev = problemList.querySelector('li.active');
+            if (prev) prev.classList.remove('active');
+            const escapedId = (window.CSS && CSS.escape) ? CSS.escape(problemId) : String(problemId).replaceAll('"', '\\"');
+            const next = problemList.querySelector(`li[data-id="${escapedId}"]`);
+            if (next) next.classList.add('active');
         }
 
         async function selectProblem(problemId) {
             const problem = problems.find(p => p.id === problemId);
             if (!problem) return;
+            if (currentProblem && currentProblem.id === problemId) return;
 
             currentProblem = problem;
-            renderProblemList();
+            selectionToken += 1;
+            const token = selectionToken;
+            updateActiveProblemInList(problemId);
             filenameTab.textContent = `${problemId}.cu`;
             submitBtn.disabled = false;
 
-            // Fetch stub and leaderboard IN PARALLEL for better performance
-            try {
-                const [stubData, _] = await Promise.all([
-                    fetchApi(`stub?problem_id=${problemId}`),
-                    loadLeaderboard(problemId)
-                ]);
+            // Kick off leaderboard load early (may render immediately from cache).
+            const leaderboardPromise = ensureLeaderboard(problemId, { render: true, force: false, token });
 
-                if (stubData.stub) {
-                    originalStub = stubData.stub;
-                    setEditorContent(stubData.stub);
-                    renderProblemInfo(stubData.stub);
+            // Swap editor model as quickly as possible.
+            try {
+                const existing = modelsByProblemId.get(problemId);
+                if (existing?.model) {
+                    editor.setModel(existing.model);
+                    renderProblemInfo(existing.originalStub);
                 } else {
-                    log('Failed to load stub: ' + (stubData.error || 'Unknown error'), 'error');
+                    const stubText = await fetchStub(problemId);
+                    if (token !== selectionToken) return;
+                    const model = monaco.editor.createModel(stubText, 'cuda');
+                    modelsByProblemId.set(problemId, { model, originalStub: stubText });
+                    editor.setModel(model);
+                    renderProblemInfo(stubText);
                 }
             } catch (error) {
                 log('Failed to load problem: ' + error.message, 'error');
             }
+
+            await leaderboardPromise;
         }
 
         function renderProblemInfo(stubContent) {
@@ -712,37 +883,18 @@
             `;
         }
 
-        async function loadLeaderboard(problemId) {
-            try {
-                const data = await fetchApi(`leaderboard?problem_id=${problemId}`);
-                const rankings = data.rankings || [];
-
-                if (rankings.length === 0) {
-                    leaderboardList.innerHTML = '<li class="empty-state">No submissions yet</li>';
-                    return;
-                }
-
-                leaderboardList.innerHTML = rankings.slice(0, 10).map((r, i) => {
-                    const rankClass = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
-                    return `
-                        <li>
-                            <span class="leaderboard-rank ${rankClass}">${r.rank}.</span>
-                            <span class="leaderboard-user">${escapeHtml(r.user_id)}</span>
-                            <span class="leaderboard-time">${r.best_time_ms.toFixed(4)}ms</span>
-                        </li>
-                    `;
-                }).join('');
-            } catch (error) {
-                leaderboardList.innerHTML = '<li class="empty-state">Failed to load</li>';
+        function setEditorContent(content) {
+            const model = editor.getModel();
+            if (model) {
+                model.setValue(content);
+            } else {
+                editor.setValue(content);
             }
         }
 
-        function setEditorContent(content) {
-            editor.setValue(content);
-        }
-
         function getEditorContent() {
-            return editor.getValue();
+            const model = editor.getModel();
+            return model ? model.getValue() : editor.getValue();
         }
 
         // Security: Escape HTML to prevent XSS attacks
@@ -787,7 +939,8 @@
                     log(`Kernel hash: ${result.kernel_hash}`, 'info');
 
                     // Refresh leaderboard
-                    await loadLeaderboard(currentProblem.id);
+                    leaderboardCache.delete(currentProblem.id);
+                    await ensureLeaderboard(currentProblem.id, { render: true, force: true, token: selectionToken });
                 } else {
                     log(`Submission failed: ${result.error}`, 'error');
                     if (result.message) {
@@ -812,8 +965,10 @@
         }
 
         function handleReset() {
-            if (originalStub) {
-                setEditorContent(originalStub);
+            if (!currentProblem) return;
+            const entry = modelsByProblemId.get(currentProblem.id);
+            if (entry?.originalStub) {
+                entry.model.setValue(entry.originalStub);
                 log('Editor reset to original stub', 'info');
             }
         }
