@@ -840,7 +840,7 @@
                 escapes: /\\(?:[abfnrtv\\"']|x[0-9A-Fa-f]{1,4}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/,
                 tokenizer: {
                     root: [
-                        [/#\s*(include|if|ifdef|ifndef|elif|else|endif|pragma|error|warning|undef|line)\b/, 'keyword.directive'],
+                        [/#\s*(define|include|if|ifdef|ifndef|elif|else|endif|pragma|error|warning|undef|line)\b/, 'keyword.directive'],
                         [/[a-z_$][\w$]*/, {
                             cases: {
                                 '@typeKeywords': 'keyword.type',
