@@ -91,6 +91,43 @@
             border-color: var(--accent);
         }
 
+        .auth-user {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            max-width: 240px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .auth-modal-row {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .auth-input {
+            background: var(--bg-editor);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.6rem 0.75rem;
+            color: var(--text);
+            font-size: 0.95rem;
+        }
+
+        .auth-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .auth-actions {
+            display: flex;
+            gap: 0.5rem;
+            justify-content: flex-end;
+            margin-top: 0.5rem;
+        }
+
         /* Main layout */
         .main-container {
             display: flex;
@@ -574,10 +611,35 @@
         <h1>GPU Kernel Leaderboard</h1>
         <div class="header-right">
             <button class="header-link" id="profile-btn" type="button">Profile</button>
-            <label style="font-size: 0.875rem; color: var(--text-muted);">Username:</label>
-            <input type="text" id="username" class="username-input" placeholder="anonymous" />
+            <div class="auth-user" id="auth-user">Not logged in</div>
+            <button class="header-link" id="login-btn" type="button">Login</button>
+            <button class="header-link" id="logout-btn" type="button" style="display:none;">Logout</button>
         </div>
     </header>
+
+    <div class="modal-overlay" id="auth-modal" role="dialog" aria-modal="true" aria-label="Login">
+        <div class="modal" style="width: min(520px, 92vw);">
+            <div class="modal-header">
+                <div style="font-weight: 600;" id="auth-title">Login</div>
+                <button class="modal-close" id="auth-close" type="button">Close</button>
+            </div>
+            <div class="modal-body">
+                <div id="auth-status" class="empty-state" style="display:none;"></div>
+                <div class="auth-modal-row">
+                    <label for="auth-username" style="font-size: 0.8rem; color: var(--text-muted);">Username</label>
+                    <input id="auth-username" class="auth-input" autocomplete="username" placeholder="your_name" />
+                </div>
+                <div class="auth-modal-row">
+                    <label for="auth-password" style="font-size: 0.8rem; color: var(--text-muted);">Password</label>
+                    <input id="auth-password" class="auth-input" type="password" autocomplete="current-password" placeholder="(no reset if lost)" />
+                </div>
+                <div class="auth-actions">
+                    <button class="btn btn-secondary" id="signup-submit" type="button">Sign up</button>
+                    <button class="btn btn-primary" id="login-submit" type="button">Login</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <div class="modal-overlay" id="profile-modal" role="dialog" aria-modal="true" aria-label="Profile">
         <div class="modal">
@@ -672,6 +734,9 @@
         let isSubmitting = false;
         let selectionToken = 0;
 
+        const AUTH_USER_ID_KEY = 'leaderboard_auth_user_id';
+        const AUTH_TOKEN_KEY = 'leaderboard_auth_token';
+
         const stubCache = new Map(); // problemId -> stubText
         const stubFetches = new Map(); // problemId -> Promise<string>
         const leaderboardCache = new Map(); // problemId -> { data, fetchedAtMs }
@@ -679,7 +744,6 @@
         const modelsByProblemId = new Map(); // problemId -> { model, originalStub }
 
         const LEADERBOARD_TTL_MS = 10_000;
-        let modalBaseHost = null; // "workspace--kernel-leaderboard" (no -endpoint suffix)
         let problemListClickBound = false;
 
         // DOM elements
@@ -690,10 +754,20 @@
         const consoleOutput = document.getElementById('console-output');
         const submitBtn = document.getElementById('submit-btn');
         const resetBtn = document.getElementById('reset-btn');
-        const usernameInput = document.getElementById('username');
         const filenameTab = document.getElementById('filename-tab');
         const clearConsoleBtn = document.getElementById('clear-console');
         const profileBtn = document.getElementById('profile-btn');
+        const authUser = document.getElementById('auth-user');
+        const loginBtn = document.getElementById('login-btn');
+        const logoutBtn = document.getElementById('logout-btn');
+        const authModal = document.getElementById('auth-modal');
+        const authClose = document.getElementById('auth-close');
+        const authTitle = document.getElementById('auth-title');
+        const authStatus = document.getElementById('auth-status');
+        const authUsername = document.getElementById('auth-username');
+        const authPassword = document.getElementById('auth-password');
+        const loginSubmit = document.getElementById('login-submit');
+        const signupSubmit = document.getElementById('signup-submit');
         const profileModal = document.getElementById('profile-modal');
         const profileClose = document.getElementById('profile-close');
         const profileStatus = document.getElementById('profile-status');
@@ -844,28 +918,6 @@
 
         // Initialize app
         async function init() {
-            // Load username from localStorage
-            const savedUsername = localStorage.getItem('leaderboard_username');
-            if (savedUsername) {
-                usernameInput.value = savedUsername;
-            }
-
-            const persistUsername = () => {
-                localStorage.setItem('leaderboard_username', usernameInput.value.trim());
-            };
-
-            // Save username as you type (so submit doesn't rely on blur/change).
-            usernameInput.addEventListener('input', persistUsername);
-            usernameInput.addEventListener('change', persistUsername);
-            usernameInput.addEventListener('blur', persistUsername);
-
-            // Compute Modal base host once (if applicable) so we can build URLs cheaply.
-            const host = window.location.host;
-            if (host.includes('modal.run')) {
-                const match = host.match(/^(.+--kernel-leaderboard)-\w+\.modal\.run$/);
-                modalBaseHost = match ? match[1] : null;
-            }
-
             // Load problems
             await loadProblems();
 
@@ -878,6 +930,17 @@
             profileModal.addEventListener('click', (e) => {
                 if (e.target === profileModal) closeProfile();
             });
+            loginBtn.addEventListener('click', openAuthModal);
+            logoutBtn.addEventListener('click', handleLogout);
+            authClose.addEventListener('click', closeAuthModal);
+            authModal.addEventListener('click', (e) => {
+                if (e.target === authModal) closeAuthModal();
+            });
+            loginSubmit.addEventListener('click', () => handleLogin({ mode: 'login' }));
+            signupSubmit.addEventListener('click', () => handleLogin({ mode: 'signup' }));
+            authPassword.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') handleLogin({ mode: 'login' });
+            });
             submissionClose.addEventListener('click', closeSubmissionModal);
             submissionModal.addEventListener('click', (e) => {
                 if (e.target === submissionModal) closeSubmissionModal();
@@ -889,10 +952,123 @@
                 if (e.key === 'Escape') {
                     closeProfile();
                     closeSubmissionModal();
+                    closeAuthModal();
                 }
             });
 
             setupSplitters();
+            updateAuthUI();
+        }
+
+        function getAuth() {
+            const userId = localStorage.getItem(AUTH_USER_ID_KEY);
+            const token = localStorage.getItem(AUTH_TOKEN_KEY);
+            if (!userId || !token) return null;
+            return { userId, token };
+        }
+
+        function setAuth(userId, token) {
+            localStorage.setItem(AUTH_USER_ID_KEY, userId);
+            localStorage.setItem(AUTH_TOKEN_KEY, token);
+            updateAuthUI();
+        }
+
+        function clearAuth() {
+            localStorage.removeItem(AUTH_USER_ID_KEY);
+            localStorage.removeItem(AUTH_TOKEN_KEY);
+            updateAuthUI();
+        }
+
+        function updateAuthUI() {
+            const auth = getAuth();
+            if (auth) {
+                authUser.textContent = `Logged in as ${auth.userId}`;
+                loginBtn.style.display = 'none';
+                logoutBtn.style.display = 'inline-block';
+                submitBtn.disabled = !currentProblem;
+            } else {
+                authUser.textContent = 'Not logged in';
+                loginBtn.style.display = 'inline-block';
+                logoutBtn.style.display = 'none';
+                submitBtn.disabled = true;
+            }
+        }
+
+        function openAuthModal() {
+            authTitle.textContent = 'Login';
+            authStatus.style.display = 'none';
+            authStatus.textContent = '';
+            authUsername.value = localStorage.getItem(AUTH_USER_ID_KEY) || '';
+            authPassword.value = '';
+            authModal.classList.add('open');
+            setTimeout(() => authUsername.focus(), 0);
+        }
+
+        function closeAuthModal() {
+            authModal.classList.remove('open');
+        }
+
+        async function handleLogin({ mode }) {
+            const userId = authUsername.value.trim();
+            const password = authPassword.value;
+            if (!userId || !password) {
+                authStatus.style.display = 'block';
+                authStatus.textContent = 'Username and password required.';
+                return;
+            }
+
+            authStatus.style.display = 'block';
+            authStatus.textContent = mode === 'signup' ? 'Creating account…' : 'Logging in…';
+
+            try {
+                if (mode === 'signup') {
+                    const created = await fetchApi('signup', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ user_id: userId, password })
+                    });
+                    if (!created?.success) {
+                        authStatus.textContent = created?.message || created?.error || 'Sign up failed.';
+                        return;
+                    }
+                }
+
+                const data = await fetchApi('login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ user_id: userId, password })
+                });
+                if (!data?.success || !data?.token || !data?.user_id) {
+                    authStatus.textContent = data?.message || data?.error || 'Login failed.';
+                    return;
+                }
+
+                setAuth(data.user_id, data.token);
+                closeAuthModal();
+                log(`Logged in as "${data.user_id}"`, 'success');
+                if (currentProblem) {
+                    await maybeLoadMyLastSubmission(currentProblem.id);
+                }
+            } catch (e) {
+                authStatus.textContent = `Failed: ${e.message || e}`;
+            }
+        }
+
+        async function handleLogout() {
+            const auth = getAuth();
+            if (!auth) return;
+            try {
+                await fetchApi('logout', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: auth.token })
+                });
+            } catch {
+                // Best-effort.
+            } finally {
+                clearAuth();
+                log('Logged out', 'info');
+            }
         }
 
         function clamp(value, min, max) {
@@ -981,11 +1157,7 @@
             // Split endpoint and query string: "leaderboard?problem_id=x" -> ["leaderboard", "problem_id=x"]
             const [endpoint, queryString] = endpointWithParams.split('?');
             const query = queryString ? `?${queryString}` : '';
-
-            if (modalBaseHost) {
-                return `https://${modalBaseHost}-${endpoint}.modal.run${query}`;
-            }
-            // Local development - assume same origin
+            // Single ASGI app deployment: same-origin paths (works both locally and on Modal).
             return `/${endpoint}${query}`;
         }
 
@@ -1184,7 +1356,7 @@
             const token = selectionToken;
             updateActiveProblemInList(problemId);
             filenameTab.textContent = `${problemId}.cu`;
-            submitBtn.disabled = false;
+            submitBtn.disabled = !getAuth();
 
             // Kick off leaderboard load early (may render immediately from cache).
             const leaderboardPromise = ensureLeaderboard(problemId, { render: true, force: false, token });
@@ -1207,7 +1379,37 @@
                 log('Failed to load problem: ' + error.message, 'error');
             }
 
+            await maybeLoadMyLastSubmission(problemId);
             await leaderboardPromise;
+        }
+
+        async function maybeLoadMyLastSubmission(problemId) {
+            const auth = getAuth();
+            if (!auth || !problemId) return;
+
+            const entry = modelsByProblemId.get(problemId);
+            const model = editor?.getModel?.();
+            if (!entry?.originalStub || !model) return;
+
+            const current = model.getValue();
+            const data = await fetchApi(`my_last_submission?problem_id=${encodeURIComponent(problemId)}&token=${encodeURIComponent(auth.token)}`);
+            if (!data || data.error) {
+                if (data?.error === 'unauthorized') {
+                    clearAuth();
+                    log('Session expired. Please log in again.', 'warning');
+                }
+                return;
+            }
+            if (typeof data.kernel_source !== 'string' || !data.kernel_source) return;
+            if (current === data.kernel_source) return;
+
+            const isPristine = current === entry.originalStub;
+            if (!isPristine) {
+                if (!confirm('Load your last submission for this problem? This will replace the editor contents.')) return;
+            }
+
+            setEditorContent(data.kernel_source);
+            log(`Loaded your last submission for ${problemId} (${data.kernel_hash || 'no hash'})`, 'info');
         }
 
         function renderProblemInfo(stubContent) {
@@ -1274,8 +1476,12 @@
         async function handleSubmit() {
             if (!currentProblem || isSubmitting) return;
 
-            const username = usernameInput.value.trim() || 'anonymous';
-            localStorage.setItem('leaderboard_username', username);
+            const auth = getAuth();
+            if (!auth) {
+                openAuthModal();
+                log('Login required to submit.', 'warning');
+                return;
+            }
             const kernelSource = getEditorContent();
 
             if (!kernelSource.trim()) {
@@ -1287,7 +1493,7 @@
             submitBtn.disabled = true;
             submitBtn.innerHTML = '<span class="spinner"></span>Submitting...';
 
-            log(`Submitting to ${currentProblem.id} as "${username}"...`, 'info');
+            log(`Submitting to ${currentProblem.id} as "${auth.userId}"...`, 'info');
 
             try {
                 const result = await fetchApi('submit', {
@@ -1295,8 +1501,8 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         problem_id: currentProblem.id,
-                        user_id: username,
-                        kernel_source: kernelSource
+                        kernel_source: kernelSource,
+                        token: auth.token
                     })
                 });
 
@@ -1326,16 +1532,19 @@
                 log('Network error: ' + error.message, 'error');
             } finally {
                 isSubmitting = false;
-                submitBtn.disabled = false;
+                submitBtn.disabled = !getAuth();
                 submitBtn.textContent = 'Submit';
             }
         }
 
         function openProfile() {
-            const username = usernameInput.value.trim() || 'anonymous';
-            localStorage.setItem('leaderboard_username', username);
+            const auth = getAuth();
+            if (!auth) {
+                openAuthModal();
+                return;
+            }
             profileModal.classList.add('open');
-            loadProfile(username);
+            loadProfile(auth.userId);
         }
 
         function closeProfile() {

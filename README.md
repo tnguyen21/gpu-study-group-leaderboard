@@ -37,12 +37,12 @@ python submit.py 01_vectoradd problems/01_vectoradd/solutions/01_naive.cu
 
 **Option B: HTTP POST (no Modal SDK needed)**
 ```bash
-curl -X POST https://your-workspace--kernel-leaderboard-submit.modal.run \
+curl -X POST https://your-workspace--kernel-leaderboard-web.modal.run/submit \
   -H "Content-Type: application/json" \
   -d "$(jq -n --arg src "$(cat problems/01_vectoradd/solutions/01_naive.cu)" '{
     "problem_id": "01_vectoradd",
-    "user_id": "your_name",
-    "kernel_source": $src
+    "kernel_source": $src,
+    "token": "SESSION_TOKEN"
   }')"
 ```
 
@@ -50,21 +50,19 @@ curl -X POST https://your-workspace--kernel-leaderboard-submit.modal.run \
 
 After deploying, Modal gives you URLs like:
 ```
-https://your-workspace--kernel-leaderboard-leaderboard.modal.run
-https://your-workspace--kernel-leaderboard-submit.modal.run
-https://your-workspace--kernel-leaderboard-problems.modal.run
+https://your-workspace--kernel-leaderboard-web.modal.run
 ```
 
 Query them with:
 ```bash
 # All problems overview
-curl https://your-workspace--kernel-leaderboard-leaderboard.modal.run
+curl https://your-workspace--kernel-leaderboard-web.modal.run/leaderboard
 
 # Specific problem rankings
-curl "https://your-workspace--kernel-leaderboard-leaderboard.modal.run?problem_id=01_vectoradd"
+curl "https://your-workspace--kernel-leaderboard-web.modal.run/leaderboard?problem_id=01_vectoradd"
 
 # List available problems
-curl https://your-workspace--kernel-leaderboard-problems.modal.run
+curl https://your-workspace--kernel-leaderboard-web.modal.run/problems
 ```
 
 ## Problems
@@ -146,8 +144,8 @@ POST JSON body:
 ```json
 {
   "problem_id": "01_vectoradd",
-  "user_id": "your_name",
   "kernel_source": "__global__ void vectorAdd(...) { ... }",
+  "token": "session_token_from_/login",
   "api_key": "optional_if_configured"
 }
 ```

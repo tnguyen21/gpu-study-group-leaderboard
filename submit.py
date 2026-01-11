@@ -57,6 +57,7 @@ def submit(problem_id: str, kernel_file: str, user_id: str):
                 user_id=user_id,
                 time_ms=result["time_ms"],
                 kernel_hash=result["kernel_hash"],
+                kernel_source=kernel_source,
             )
         except Exception as e:
             print(f"Warning: benchmark succeeded but failed to record submission: {e}")

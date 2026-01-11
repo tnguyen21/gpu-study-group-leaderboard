@@ -57,6 +57,8 @@ MAX_RUN_OUTPUT_BYTES = 100_000
 
 MAX_PROFILE_RESULTS = 200
 
+USER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
 
 # --- Security: Kernel Source Validation ---
 
@@ -216,14 +218,28 @@ def ensure_db_schema(conn) -> None:
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
             display_name TEXT,
+            password_hash TEXT,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     """)
 
     # Migration path for existing volumes created before kernel_source existed.
     cols = {row[1] for row in conn.execute("PRAGMA table_info(submissions)").fetchall()}
     if "kernel_source" not in cols:
         conn.execute("ALTER TABLE submissions ADD COLUMN kernel_source TEXT")
+
+    user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "password_hash" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
 
     conn.commit()
     _DB_SCHEMA_READY = True
@@ -356,6 +372,79 @@ def parse_time_ms(stdout: str) -> float:
         raise ValueError("Could not parse TIME_MS from output")
     return time_ms
 
+
+def validate_user_id(user_id: str) -> tuple[bool, str, str]:
+    if not isinstance(user_id, str) or not user_id:
+        return False, "invalid_user_id", "Username is required"
+    if len(user_id) > MAX_USER_ID_LENGTH:
+        return False, "invalid_user_id", f"Username must be under {MAX_USER_ID_LENGTH} characters"
+    if not USER_ID_RE.fullmatch(user_id):
+        return False, "invalid_user_id", "Username must match ^[a-zA-Z0-9_-]{1,64}$"
+    return True, "", ""
+
+
+def hash_password(password: str) -> str:
+    import base64
+    import hashlib
+    import secrets
+
+    if not isinstance(password, str) or not password:
+        raise ValueError("Password required")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters")
+    if len(password) > 200:
+        raise ValueError("Password too long")
+
+    iterations = 200_000
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt).decode("ascii").rstrip("="),
+        base64.urlsafe_b64encode(dk).decode("ascii").rstrip("="),
+    )
+
+
+def verify_password(password: str, stored: str) -> bool:
+    import base64
+    import hashlib
+    import hmac
+
+    if not isinstance(password, str) or not isinstance(stored, str) or not stored:
+        return False
+    parts = stored.split("$")
+    if len(parts) != 4:
+        return False
+    algo, iter_s, salt_b64, hash_b64 = parts
+    if algo != "pbkdf2_sha256":
+        return False
+    try:
+        iterations = int(iter_s)
+        salt = base64.urlsafe_b64decode(salt_b64 + "==")
+        expected = base64.urlsafe_b64decode(hash_b64 + "==")
+    except Exception:
+        return False
+
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(dk, expected)
+
+
+def create_session_token() -> str:
+    import secrets
+
+    return secrets.token_urlsafe(32)
+
+
+def get_user_id_for_token(conn, token: str) -> str | None:
+    from datetime import datetime
+
+    if not isinstance(token, str) or not token:
+        return None
+    row = conn.execute("SELECT user_id FROM sessions WHERE token = ?", (token,)).fetchone()
+    if row is None:
+        return None
+    conn.execute("UPDATE sessions SET last_used_at = ? WHERE token = ?", (datetime.utcnow().isoformat(), token))
+    return row[0]
 # --- Modal Functions ---
 
 
@@ -517,337 +606,455 @@ def benchmark_kernel(problem_id: str, user_id: str, kernel_source: str) -> dict:
         }
 
 
-@app.function(image=web_image, volumes={"/data": vol})
-@modal.fastapi_endpoint(method="GET")
-def leaderboard(problem_id: str = None):
-    """Get leaderboard data as JSON."""
+@app.function(image=web_image, volumes={"/data": vol}, timeout=180)
+@modal.asgi_app()
+def web():
+    """Single FastAPI app (1 Modal web endpoint) serving both UI and API routes."""
     import sqlite3
+    from datetime import datetime
 
-    from fastapi.responses import JSONResponse
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse, JSONResponse
 
-    problems = get_problems()
-    vol.reload()  # Get latest data from other containers
-    conn = sqlite3.connect(DB_PATH)
-    ensure_db_schema(conn)
-    conn.row_factory = sqlite3.Row
+    api = FastAPI()
 
-    if problem_id:
+    @api.get("/")
+    def index():
+        html_path = Path("/app/static/index.html")
+        if html_path.exists():
+            return HTMLResponse(content=html_path.read_text(), headers={"Cache-Control": "public, max-age=300"})
+        return HTMLResponse(content="<h1>Error: index.html not found</h1>", status_code=404)
+
+    @api.get("/leaderboard")
+    def leaderboard(problem_id: str | None = None):
+        problems = get_problems()
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH)
+        ensure_db_schema(conn)
+        conn.row_factory = sqlite3.Row
+
+        if problem_id:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.user_id,
+                    MIN(s.time_ms) as best_time_ms,
+                    COUNT(*) as attempts,
+                    MAX(s.submitted_at) as last_submission,
+                    (
+                        SELECT s2.id
+                        FROM submissions s2
+                        WHERE s2.problem_id = s.problem_id AND s2.user_id = s.user_id
+                        ORDER BY s2.time_ms ASC, s2.id ASC
+                        LIMIT 1
+                    ) as best_submission_id
+                FROM submissions s
+                WHERE s.problem_id = ?
+                GROUP BY s.user_id
+                ORDER BY best_time_ms ASC
+                """,
+                (problem_id,),
+            ).fetchall()
+
+            result = {
+                "problem_id": problem_id,
+                "problem_name": problems.get(problem_id, {}).get("name", problem_id),
+                "rankings": [
+                    {
+                        "rank": i + 1,
+                        "user_id": r["user_id"],
+                        "best_time_ms": round(r["best_time_ms"], 4),
+                        "attempts": r["attempts"],
+                        "last_submission": r["last_submission"],
+                        "best_submission_id": r["best_submission_id"],
+                    }
+                    for i, r in enumerate(rows)
+                ],
+            }
+        else:
+            rows = conn.execute("""
+                SELECT
+                    problem_id,
+                    COUNT(DISTINCT user_id) as participants,
+                    COUNT(*) as total_submissions,
+                    MIN(time_ms) as best_time_ms
+                FROM submissions
+                GROUP BY problem_id
+            """).fetchall()
+
+            result = {
+                "problems": [
+                    {
+                        "problem_id": r["problem_id"],
+                        "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
+                        "participants": r["participants"],
+                        "total_submissions": r["total_submissions"],
+                        "best_time_ms": round(r["best_time_ms"], 4) if r["best_time_ms"] else None,
+                    }
+                    for r in rows
+                ],
+            }
+
+        conn.close()
+        return JSONResponse(content=result, headers={"Cache-Control": "public, max-age=10"})
+
+    @api.get("/problems")
+    def problems():
+        all_problems = get_problems()
+        data = {
+            "problems": [
+                {
+                    "id": pid,
+                    "name": pdata["name"],
+                    "expected_signature": pdata["expected_signature"],
+                }
+                for pid, pdata in all_problems.items()
+            ]
+        }
+        return JSONResponse(content=data, headers={"Cache-Control": "public, max-age=86400"})
+
+    @api.get("/stub")
+    def stub(problem_id: str):
+        probs = get_problems()
+        if problem_id not in probs:
+            return JSONResponse(content={"error": f"Problem '{problem_id}' not found"}, status_code=404)
+
+        stubs = get_stubs_by_id()
+        if problem_id in stubs:
+            return JSONResponse(
+                content={"stub": stubs[problem_id]},
+                headers={"Cache-Control": "public, max-age=604800"},
+            )
+        return JSONResponse(content={"error": "Stub file not found"}, status_code=404)
+
+    @api.get("/stubs")
+    def stubs():
+        return JSONResponse(
+            content={"stubs": get_stubs_by_id()},
+            headers={"Cache-Control": "public, max-age=604800"},
+        )
+
+    @api.get("/profile")
+    def profile(user_id: str, limit: int = 50):
+        if not isinstance(user_id, str) or not user_id:
+            return JSONResponse(content={"error": "missing_user_id"}, status_code=400)
+        if len(user_id) > MAX_USER_ID_LENGTH:
+            return JSONResponse(content={"error": "invalid_user_id"}, status_code=400)
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(MAX_PROFILE_RESULTS, limit))
+
+        problems = get_problems()
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH)
+        ensure_db_schema(conn)
+        conn.row_factory = sqlite3.Row
+
         rows = conn.execute(
             """
             SELECT
-                s.user_id,
-                MIN(s.time_ms) as best_time_ms,
-                COUNT(*) as attempts,
-                MAX(s.submitted_at) as last_submission,
-                (
-                    SELECT s2.id
-                    FROM submissions s2
-                    WHERE s2.problem_id = s.problem_id AND s2.user_id = s.user_id
-                    ORDER BY s2.time_ms ASC, s2.id ASC
-                    LIMIT 1
-                ) as best_submission_id
-            FROM submissions s
-            WHERE s.problem_id = ?
-            GROUP BY s.user_id
-            ORDER BY best_time_ms ASC
-        """,
-            (problem_id,),
+                id,
+                problem_id,
+                time_ms,
+                kernel_hash,
+                submitted_at
+            FROM submissions
+            WHERE user_id = ?
+            ORDER BY submitted_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
         ).fetchall()
 
-        result = {
-            "problem_id": problem_id,
-            "problem_name": problems.get(problem_id, {}).get("name", problem_id),
-            "rankings": [
-                {
-                    "rank": i + 1,
-                    "user_id": r["user_id"],
-                    "best_time_ms": round(r["best_time_ms"], 4),
-                    "attempts": r["attempts"],
-                    "last_submission": r["last_submission"],
-                    "best_submission_id": r["best_submission_id"],
-                }
-                for i, r in enumerate(rows)
-            ],
-        }
-    else:
-        rows = conn.execute("""
+        best_rows = conn.execute(
+            """
             SELECT
                 problem_id,
-                COUNT(DISTINCT user_id) as participants,
-                COUNT(*) as total_submissions,
-                MIN(time_ms) as best_time_ms
+                MIN(time_ms) AS best_time_ms
             FROM submissions
+            WHERE user_id = ?
             GROUP BY problem_id
-        """).fetchall()
+            """,
+            (user_id,),
+        ).fetchall()
 
-        result = {
-            "problems": [
-                {
-                    "problem_id": r["problem_id"],
-                    "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
-                    "participants": r["participants"],
-                    "total_submissions": r["total_submissions"],
-                    "best_time_ms": round(r["best_time_ms"], 4) if r["best_time_ms"] else None,
-                }
-                for r in rows
-            ],
-        }
-
-    conn.close()
-    # Cache for 10 seconds - leaderboard updates frequently
-    return JSONResponse(content=result, headers={"Cache-Control": "public, max-age=10"})
-
-
-@app.function(image=web_image)
-@modal.fastapi_endpoint(method="GET")
-def problems():
-    """List available problems."""
-    from fastapi.responses import JSONResponse
-
-    all_problems = get_problems()
-    data = {
-        "problems": [
-            {
-                "id": pid,
-                "name": pdata["name"],
-                "expected_signature": pdata["expected_signature"],
-            }
-            for pid, pdata in all_problems.items()
-        ]
-    }
-    # Cache for 1 day - problems only change on redeployment
-    return JSONResponse(content=data, headers={"Cache-Control": "public, max-age=86400"})
-
-
-@app.function(image=web_image)
-@modal.fastapi_endpoint(method="GET")
-def stub(problem_id: str):
-    """Get the stub.cu content for a problem (for web editor)."""
-    from fastapi.responses import JSONResponse
-
-    probs = get_problems()
-    if problem_id not in probs:
+        conn.close()
         return JSONResponse(
-            content={"error": f"Problem '{problem_id}' not found"}, status_code=404
+            content={
+                "user_id": user_id,
+                "recent": [
+                    {
+                        "submission_id": r["id"],
+                        "problem_id": r["problem_id"],
+                        "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
+                        "time_ms": round(r["time_ms"], 4),
+                        "kernel_hash": r["kernel_hash"],
+                        "submitted_at": r["submitted_at"],
+                    }
+                    for r in rows
+                ],
+                "best_by_problem": [
+                    {
+                        "problem_id": r["problem_id"],
+                        "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
+                        "best_time_ms": round(r["best_time_ms"], 4) if r["best_time_ms"] is not None else None,
+                    }
+                    for r in best_rows
+                ],
+            },
+            headers={"Cache-Control": "private, max-age=5"},
         )
 
-    stubs = get_stubs_by_id()
-    if problem_id in stubs:
-        # Cache for 7 days - stubs never change between deployments
+    @api.get("/submission")
+    def submission(submission_id: int):
+        try:
+            submission_id = int(submission_id)
+        except (TypeError, ValueError):
+            return JSONResponse(content={"error": "invalid_submission_id"}, status_code=400)
+        if submission_id <= 0:
+            return JSONResponse(content={"error": "invalid_submission_id"}, status_code=400)
+
+        problems = get_problems()
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH)
+        ensure_db_schema(conn)
+        conn.row_factory = sqlite3.Row
+
+        row = conn.execute(
+            """
+            SELECT
+                id,
+                problem_id,
+                user_id,
+                time_ms,
+                kernel_hash,
+                kernel_source,
+                submitted_at
+            FROM submissions
+            WHERE id = ?
+            """,
+            (submission_id,),
+        ).fetchone()
+        conn.close()
+
+        if row is None:
+            return JSONResponse(content={"error": "not_found"}, status_code=404)
+
         return JSONResponse(
-            content={"stub": stubs[problem_id]},
-            headers={"Cache-Control": "public, max-age=604800"},
+            content={
+                "submission_id": row["id"],
+                "problem_id": row["problem_id"],
+                "problem_name": problems.get(row["problem_id"], {}).get("name", row["problem_id"]),
+                "user_id": row["user_id"],
+                "time_ms": round(row["time_ms"], 4),
+                "kernel_hash": row["kernel_hash"],
+                "kernel_source": row["kernel_source"] or "",
+                "submitted_at": row["submitted_at"],
+            },
+            headers={"Cache-Control": "private, max-age=60"},
         )
-    return JSONResponse(content={"error": "Stub file not found"}, status_code=404)
 
-@app.function(image=web_image)
-@modal.fastapi_endpoint(method="GET")
-def stubs():
-    """Get all stub.cu contents for all problems in one request."""
-    from fastapi.responses import JSONResponse
+    @api.post("/signup")
+    def signup(request: dict):
+        user_id = request.get("user_id")
+        password = request.get("password")
 
-    return JSONResponse(
-        content={"stubs": get_stubs_by_id()},
-        headers={"Cache-Control": "public, max-age=604800"},
-    )
+        ok, err, msg = validate_user_id(user_id)
+        if not ok:
+            return JSONResponse(content={"success": False, "error": err, "message": msg}, status_code=400)
+        try:
+            password_hash = hash_password(password)
+        except ValueError as e:
+            return JSONResponse(content={"success": False, "error": "invalid_password", "message": str(e)}, status_code=400)
 
-@app.function(image=web_image, volumes={"/data": vol})
-@modal.fastapi_endpoint(method="GET")
-def profile(user_id: str, limit: int = 50):
-    """Get recent submissions for a user across all problems."""
-    import sqlite3
+        os.makedirs("/data", exist_ok=True)
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        ensure_db_schema(conn)
 
-    from fastapi.responses import JSONResponse
+        existing = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if existing is not None:
+            conn.close()
+            return JSONResponse(
+                content={"success": False, "error": "user_exists", "message": "Username already taken"},
+                status_code=409,
+            )
 
-    if not isinstance(user_id, str) or not user_id:
-        return JSONResponse(content={"error": "missing_user_id"}, status_code=400)
-    if len(user_id) > MAX_USER_ID_LENGTH:
-        return JSONResponse(content={"error": "invalid_user_id"}, status_code=400)
+        conn.execute(
+            "INSERT INTO users (user_id, display_name, password_hash, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, None, password_hash, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        vol.commit()
 
-    try:
-        limit = int(limit)
-    except (TypeError, ValueError):
-        limit = 50
-    limit = max(1, min(MAX_PROFILE_RESULTS, limit))
+        return JSONResponse(content={"success": True, "user_id": user_id}, headers={"Cache-Control": "no-store"})
 
-    problems = get_problems()
-    vol.reload()
-    conn = sqlite3.connect(DB_PATH)
-    ensure_db_schema(conn)
-    conn.row_factory = sqlite3.Row
+    @api.post("/login")
+    def login(request: dict):
+        user_id = request.get("user_id")
+        password = request.get("password")
 
-    rows = conn.execute(
-        """
-        SELECT
-            id,
-            problem_id,
-            time_ms,
-            kernel_hash,
-            submitted_at
-        FROM submissions
-        WHERE user_id = ?
-        ORDER BY submitted_at DESC, id DESC
-        LIMIT ?
-        """,
-        (user_id, limit),
-    ).fetchall()
+        ok, err, msg = validate_user_id(user_id)
+        if not ok:
+            return JSONResponse(content={"success": False, "error": err, "message": msg}, status_code=400)
+        if not isinstance(password, str) or not password:
+            return JSONResponse(content={"success": False, "error": "invalid_password", "message": "Password required"}, status_code=400)
 
-    best_rows = conn.execute(
-        """
-        SELECT
-            problem_id,
-            MIN(time_ms) AS best_time_ms
-        FROM submissions
-        WHERE user_id = ?
-        GROUP BY problem_id
-        """,
-        (user_id,),
-    ).fetchall()
+        os.makedirs("/data", exist_ok=True)
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        ensure_db_schema(conn)
 
-    conn.close()
+        row = conn.execute("SELECT password_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None or not row[0] or not verify_password(password, row[0]):
+            conn.close()
+            return JSONResponse(
+                content={"success": False, "error": "invalid_credentials", "message": "Invalid username or password"},
+                status_code=401,
+            )
 
-    return JSONResponse(
-        content={
-            "user_id": user_id,
-            "recent": [
-                {
-                    "submission_id": r["id"],
-                    "problem_id": r["problem_id"],
-                    "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
-                    "time_ms": round(r["time_ms"], 4),
-                    "kernel_hash": r["kernel_hash"],
-                    "submitted_at": r["submitted_at"],
+        token = create_session_token()
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, created_at, last_used_at) VALUES (?, ?, ?, ?)",
+            (token, user_id, datetime.utcnow().isoformat(), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        vol.commit()
+
+        return JSONResponse(content={"success": True, "user_id": user_id, "token": token}, headers={"Cache-Control": "no-store"})
+
+    @api.post("/logout")
+    def logout(request: dict):
+        token = request.get("token")
+        if not isinstance(token, str) or not token:
+            return JSONResponse(content={"success": False, "error": "missing_token"}, status_code=400)
+
+        os.makedirs("/data", exist_ok=True)
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        ensure_db_schema(conn)
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        vol.commit()
+        return JSONResponse(content={"success": True}, headers={"Cache-Control": "no-store"})
+
+    @api.get("/my_last_submission")
+    def my_last_submission(problem_id: str, token: str):
+        if not isinstance(problem_id, str) or not problem_id:
+            return JSONResponse(content={"error": "missing_problem_id"}, status_code=400)
+        if not isinstance(token, str) or not token:
+            return JSONResponse(content={"error": "missing_token"}, status_code=400)
+
+        problems = get_problems()
+        if problem_id not in problems:
+            return JSONResponse(content={"error": "unknown_problem"}, status_code=404)
+
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH)
+        ensure_db_schema(conn)
+        conn.row_factory = sqlite3.Row
+
+        user_id = get_user_id_for_token(conn, token)
+        if user_id is None:
+            conn.close()
+            return JSONResponse(content={"error": "unauthorized"}, status_code=401)
+
+        row = conn.execute(
+            """
+            SELECT
+                id,
+                problem_id,
+                user_id,
+                time_ms,
+                kernel_hash,
+                kernel_source,
+                submitted_at
+            FROM submissions
+            WHERE problem_id = ? AND user_id = ?
+            ORDER BY submitted_at DESC, id DESC
+            LIMIT 1
+            """,
+            (problem_id, user_id),
+        ).fetchone()
+        conn.commit()
+        conn.close()
+        vol.commit()
+
+        if row is None:
+            return JSONResponse(content={"error": "not_found"}, status_code=404)
+
+        return JSONResponse(
+            content={
+                "submission_id": row["id"],
+                "problem_id": row["problem_id"],
+                "problem_name": problems.get(row["problem_id"], {}).get("name", row["problem_id"]),
+                "user_id": row["user_id"],
+                "time_ms": round(row["time_ms"], 4),
+                "kernel_hash": row["kernel_hash"],
+                "kernel_source": row["kernel_source"] or "",
+                "submitted_at": row["submitted_at"],
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @api.post("/submit")
+    def submit(request: dict):
+        problem_id = request.get("problem_id")
+        token = request.get("token")
+        kernel_source = request.get("kernel_source")
+
+        ok, err, msg = validate_submission_inputs(problem_id, "placeholder", kernel_source)
+        if not ok:
+            return {"success": False, "error": err, "message": msg}
+
+        if SUBMIT_API_KEY is not None:
+            provided_key = request.get("api_key")
+            if provided_key != SUBMIT_API_KEY:
+                return {
+                    "success": False,
+                    "error": "unauthorized",
+                    "message": "Invalid or missing API key",
                 }
-                for r in rows
-            ],
-            "best_by_problem": [
-                {
-                    "problem_id": r["problem_id"],
-                    "problem_name": problems.get(r["problem_id"], {}).get("name", r["problem_id"]),
-                    "best_time_ms": round(r["best_time_ms"], 4) if r["best_time_ms"] is not None else None,
-                }
-                for r in best_rows
-            ],
-        },
-        headers={"Cache-Control": "private, max-age=5"},
-    )
 
-
-@app.function(image=web_image, volumes={"/data": vol})
-@modal.fastapi_endpoint(method="GET")
-def submission(submission_id: int):
-    """Get stored kernel_source for a single submission."""
-    import sqlite3
-
-    from fastapi.responses import JSONResponse
-
-    try:
-        submission_id = int(submission_id)
-    except (TypeError, ValueError):
-        return JSONResponse(content={"error": "invalid_submission_id"}, status_code=400)
-    if submission_id <= 0:
-        return JSONResponse(content={"error": "invalid_submission_id"}, status_code=400)
-
-    problems = get_problems()
-    vol.reload()
-    conn = sqlite3.connect(DB_PATH)
-    ensure_db_schema(conn)
-    conn.row_factory = sqlite3.Row
-
-    row = conn.execute(
-        """
-        SELECT
-            id,
-            problem_id,
-            user_id,
-            time_ms,
-            kernel_hash,
-            kernel_source,
-            submitted_at
-        FROM submissions
-        WHERE id = ?
-        """,
-        (submission_id,),
-    ).fetchone()
-    conn.close()
-
-    if row is None:
-        return JSONResponse(content={"error": "not_found"}, status_code=404)
-
-    return JSONResponse(
-        content={
-            "submission_id": row["id"],
-            "problem_id": row["problem_id"],
-            "problem_name": problems.get(row["problem_id"], {}).get("name", row["problem_id"]),
-            "user_id": row["user_id"],
-            "time_ms": round(row["time_ms"], 4),
-            "kernel_hash": row["kernel_hash"],
-            "kernel_source": row["kernel_source"] or "",
-            "submitted_at": row["submitted_at"],
-        },
-        headers={"Cache-Control": "private, max-age=60"},
-    )
-
-
-@app.function(image=web_image)
-@modal.fastapi_endpoint(method="GET")
-def index():
-    """Serve the main web UI."""
-    from fastapi.responses import HTMLResponse
-
-    html_path = Path("/app/static/index.html")
-    if html_path.exists():
-        return HTMLResponse(content=html_path.read_text(), headers={"Cache-Control": "public, max-age=300"})
-    return HTMLResponse(content="<h1>Error: index.html not found</h1>", status_code=404)
-
-
-@app.function(
-    image=web_image,
-    timeout=120,
-)
-@modal.fastapi_endpoint(method="POST")
-def submit(request: dict):
-    """
-    HTTP endpoint for kernel submissions.
-
-    POST body (JSON):
-    {
-        "problem_id": "week01_vectoradd",
-        "user_id": "tommy",
-        "kernel_source": "__global__ void vectorAdd(...) { ... }",
-        "api_key": "optional_if_configured"
-    }
-
-    This allows anyone to submit without needing Modal SDK access.
-    """
-    problem_id = request.get("problem_id")
-    user_id = request.get("user_id", "anonymous")
-    kernel_source = request.get("kernel_source")
-
-    ok, err, msg = validate_submission_inputs(problem_id, user_id, kernel_source)
-    if not ok:
-        return {"success": False, "error": err, "message": msg}
-
-    # Optional API key check
-    if SUBMIT_API_KEY is not None:
-        provided_key = request.get("api_key")
-        if provided_key != SUBMIT_API_KEY:
+        if not isinstance(token, str) or not token:
             return {
                 "success": False,
                 "error": "unauthorized",
-                "message": "Invalid or missing API key",
+                "message": "Login required (missing token).",
             }
 
-    result = benchmark_kernel.remote(problem_id, user_id, kernel_source)
-    if not result.get("success"):
-        return result
+        vol.reload()
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        ensure_db_schema(conn)
+        user_id = get_user_id_for_token(conn, token)
+        conn.commit()
+        conn.close()
+        vol.commit()
+        if user_id is None:
+            return {
+                "success": False,
+                "error": "unauthorized",
+                "message": "Login required (invalid token).",
+            }
 
-    record_submission.remote(problem_id, user_id, result["time_ms"], result["kernel_hash"], kernel_source)
-    return {
-        **result,
-        "user_id": user_id,
-        "problem_id": problem_id,
-    }
+        result = benchmark_kernel.remote(problem_id, user_id, kernel_source)
+        if not result.get("success"):
+            return result
+
+        record_submission.remote(problem_id, user_id, result["time_ms"], result["kernel_hash"], kernel_source)
+        return {
+            **result,
+            "user_id": user_id,
+            "problem_id": problem_id,
+        }
+
+    return api
 
 
 # --- Local entrypoint for testing ---
